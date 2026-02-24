@@ -10,9 +10,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 # Ensure local sibling repositories are importable in workspace deployments.
-_WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
-_DEXCONTROL_SRC = _WORKSPACE_ROOT / "custom_dexcontrol" / "src"
-_DEXCONTROL_TELEOP = _WORKSPACE_ROOT / "custom_dexcontrol" / "examples" / "teleop"
+# robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
+#   parents: [0]=vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
+_REPO_ROOT = Path(__file__).resolve().parents[4]
+_DEXCONTROL_SRC = _REPO_ROOT / "src"
+_DEXCONTROL_TELEOP = _REPO_ROOT / "examples" / "teleop"
 for _path in (_DEXCONTROL_SRC, _DEXCONTROL_TELEOP):
     if _path.exists() and str(_path) not in sys.path:
         sys.path.insert(0, str(_path))

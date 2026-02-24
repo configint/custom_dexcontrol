@@ -16,7 +16,11 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 # Add package root for local imports.
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# server.py lives at: <repo>/src/dexcontrol/core/robotenv_vega/server.py
+#   parents: [0]=robotenv_vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
+_this = Path(__file__).resolve()
+sys.path.insert(0, str(_this.parents[2]))  # src/dexcontrol/ -> "from core.vega..."
+sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
 
 from core.vega.robot import (  # noqa: E402
     CommunicationFailedError,
