@@ -51,8 +51,8 @@ def format_pose(cart: list | np.ndarray) -> str:
     if len(a) < 6:
         return str(cart)
     x, y, z = a[0], a[1], a[2]
-    r, p, y = np.rad2deg(a[3]), np.rad2deg(a[4]), np.rad2deg(a[5])
-    return f"xyz=({x:.3f}, {y:.3f}, {z:.3f}) m  rpy=({r:.1f}, {p:.1f}, {y:.1f}) deg"
+    roll, pitch, yaw = np.rad2deg(a[3]), np.rad2deg(a[4]), np.rad2deg(a[5])
+    return f"xyz=({x:.3f}, {y:.3f}, {z:.3f}) m  rpy=({roll:.1f}, {pitch:.1f}, {yaw:.1f}) deg"
 
 
 def main() -> None:

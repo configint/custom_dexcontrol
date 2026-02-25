@@ -16,6 +16,43 @@ To run the examples in this repo, you can try:
 pip install dexcontrol[example]
 ```
 
+### Robotiq 2F-85 Gripper (optional)
+
+If you want to use a Robotiq 2F-85 gripper connected via USB-RS485, clone this
+repo with submodules and install the gripper package:
+
+```shell
+# Clone with submodule
+git clone --recurse-submodules https://github.com/configint/custom_dexcontrol.git
+
+# If you already cloned without --recurse-submodules:
+git submodule update --init --recursive
+
+# Install the gripper package
+pip install -e robotiq_2f_85_controller/
+```
+
+Then start the RobotEnv server with `--gripper-type robotiq`:
+
+```shell
+python src/dexcontrol/core/robotenv_vega/server.py \
+    --arm-side left \
+    --gripper-type robotiq \
+    --robotiq-comport /dev/ttyUSB0
+```
+
+Or instantiate `VegaRobot` directly:
+
+```python
+from dexcontrol.core.vega.robot import VegaRobot
+
+robot = VegaRobot(
+    arm_side="left",
+    gripper_type="robotiq",
+    robotiq_comport="/dev/ttyUSB0",
+)
+```
+
 ## ⚠️ Version Compatibility
 
 **Important:** `dexcontrol >= 0.4.0` requires robot firmware `>= 0.4.0`. Using older firmware with this version will not work.

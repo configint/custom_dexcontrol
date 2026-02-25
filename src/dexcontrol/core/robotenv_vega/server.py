@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json as _json
 import logging
 import signal
 import sys
@@ -14,6 +15,16 @@ from typing import Any, Optional
 import grpc
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+# #region agent log
+_DBG_LOG = "/home/dexmate/.cursor/debug-2bec47.log"
+def _dlog(loc, msg, data=None, hyp="", run=""):
+    try:
+        with open(_DBG_LOG, "a") as f:
+            f.write(_json.dumps({"sessionId":"2bec47","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(time.time()*1000)})+"\n")
+    except Exception:
+        pass
+# #endregion
 
 # Add package root for local imports.
 # server.py lives at: <repo>/src/dexcontrol/core/robotenv_vega/server.py
@@ -45,6 +56,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         frame_type: str = "vega_mobile_base",
         control_hz: int = 20,
         base_frame_rotation: Optional[list[float]] = None,
+        ik_solver_type: str = "pink",
+        robotiq_comport: str = "/dev/ttyUSB0",
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -66,6 +79,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             arm_side=arm_side,
             control_hz=control_hz,
             gripper_type=gripper_type,
+            ik_solver_type=ik_solver_type,
+            robotiq_comport=robotiq_comport,
         )
         self._robot.launch_robot()
 
@@ -271,8 +286,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             gripper_action_space = "velocity" if "velocity" in action_space else "position"
 
         try:
+            # #region agent log
+            t_step_start = time.time()
+            # #endregion
             if self.R_world_to_robot is not None and "cartesian" in action_space:
                 action = self._transform_action_to_robot_frame(action)
+            # #region agent log
+            t_after_xform = time.time()
+            # #endregion
 
             self._robot.update_command(
                 action,
@@ -280,7 +301,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 gripper_action_space=gripper_action_space,
                 blocking=False,
             )
+            # #region agent log
+            t_after_cmd = time.time()
+            # #endregion
             observation, timestamp_us = self._create_observation()
+            # #region agent log
+            t_after_obs = time.time()
+            _dlog("server.py:Step","step_timing",{"xform_ms":(t_after_xform-t_step_start)*1000,"update_cmd_ms":(t_after_cmd-t_after_xform)*1000,"create_obs_ms":(t_after_obs-t_after_cmd)*1000,"total_ms":(t_after_obs-t_step_start)*1000},hyp="H_STEP_TIMING")
+            # #endregion
             return robotenv_pb2.StepResponse(
                 observation=observation,
                 status="SUCCESS",
@@ -395,12 +423,70 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             now_us = int(time.time() * 1_000_000)
             return {}, now_us
 
+    _RESET_TOLERANCE_RAD = 0.05
+    _RESET_TIMEOUT_S = 30.0
+    _RESET_CMD_HZ = 200.0
+    _RESET_MAX_STEP_RAD = 0.25
+    _RESET_SETTLE_S = 0.5
+
     def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
+        # #region agent log
+        t0 = time.time()
+        actual_before = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+        _dlog("server.py:reset_seq","reset_start",{"target":target_joints,"actual_before":actual_before,"arm_side":self.arm_side},hyp="H1A,H1B,H1C")
+        # #endregion
         self._robot.update_gripper(0.0, velocity=False, blocking=True)
-        self._robot.update_joints(self.safe_transit_pose, velocity=False, blocking=True)
-        self._robot.update_joints(np.asarray(target_joints, dtype=np.float64), velocity=False, blocking=True)
-        # Allow time for the arm to reach the target before we return the observation
-        time.sleep(4.0)
+        target_f64 = np.asarray(target_joints, dtype=np.float64)
+        self._move_incremental(target_f64)
+        self._robot.sync_motion_manager_with_arm(
+            np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+        )
+        # #region agent log
+        actual_after = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+        err = np.abs(actual_after - target_f64)
+        _dlog("server.py:reset_seq","reset_done",{"target":target_f64,"actual_after":actual_after,"max_err_rad":float(np.max(err)),"err_per_joint":err,"elapsed_s":time.time()-t0},hyp="H1A,H1C")
+        # #endregion
+
+    def _move_incremental(
+        self,
+        target: np.ndarray,
+        tolerance: float | None = None,
+        timeout: float | None = None,
+    ) -> None:
+        """Move to target in incremental steps respecting motor delta limit."""
+        tol = tolerance if tolerance is not None else self._RESET_TOLERANCE_RAD
+        t_max = timeout if timeout is not None else self._RESET_TIMEOUT_S
+        target = np.asarray(target, dtype=np.float64)
+        dt = 1.0 / self._RESET_CMD_HZ
+        max_step = self._RESET_MAX_STEP_RAD
+        deadline = time.time() + t_max
+        settle_start = None
+
+        while time.time() < deadline:
+            actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+            diff = target - actual
+            max_err = float(np.max(np.abs(diff)))
+            if max_err < tol:
+                break
+
+            clipped = np.clip(diff, -max_step, max_step)
+            intermediate = actual + clipped
+            self._robot.arm._send_position_command(intermediate)
+            time.sleep(dt)
+
+            new_actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+            max_move = float(np.max(np.abs(new_actual - actual)))
+            if max_move < 0.001:
+                if settle_start is None:
+                    settle_start = time.time()
+                elif time.time() - settle_start > self._RESET_SETTLE_S:
+                    LOGGER.info(
+                        "Arm settled with max error %.4f rad (tolerance %.4f)",
+                        max_err, tol,
+                    )
+                    break
+            else:
+                settle_start = None
 
     def _extract_target_joints(self, request) -> np.ndarray:
         if "joint_positions" not in request.params:
@@ -462,6 +548,8 @@ def serve(
     frame_type: str = "vega_mobile_base",
     control_hz: int = 20,
     base_frame_rotation: Optional[list[float]] = None,
+    ik_solver_type: str = "pink",
+    robotiq_comport: str = "/dev/ttyUSB0",
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -484,6 +572,8 @@ def serve(
         frame_type=frame_type,
         control_hz=control_hz,
         base_frame_rotation=base_frame_rotation,
+        ik_solver_type=ik_solver_type,
+        robotiq_comport=robotiq_comport,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -559,6 +649,19 @@ def main() -> None:
         metavar=("ROLL", "PITCH", "YAW"),
         help="Custom base-frame rotation in degrees",
     )
+    parser.add_argument(
+        "--ik-solver",
+        type=str,
+        default="pink",
+        choices=["pink", "placo"],
+        help="IK solver backend (default: pink)",
+    )
+    parser.add_argument(
+        "--robotiq-comport",
+        type=str,
+        default="/dev/ttyUSB0",
+        help="Serial port for Robotiq gripper when --gripper-type=robotiq (default: /dev/ttyUSB0)",
+    )
     args = parser.parse_args()
 
     serve(
@@ -569,8 +672,12 @@ def main() -> None:
         frame_type=args.frame_type,
         control_hz=args.control_hz,
         base_frame_rotation=args.base_frame_rotation,
+        ik_solver_type=args.ik_solver,
+        robotiq_comport=args.robotiq_comport,
     )
 
 
 if __name__ == "__main__":
+    main()
+
     main()

@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
+import json as _json
 import sys
+import time as _time
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+# #region agent log
+_DBG_LOG = "/home/dexmate/.cursor/debug-2bec47.log"
+def _dlog(loc, msg, data=None, hyp="", run=""):
+    try:
+        with open(_DBG_LOG, "a") as f:
+            f.write(_json.dumps({"sessionId":"2bec47","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(_time.time()*1000)})+"\n")
+    except Exception:
+        pass
+# #endregion
 
 # Ensure local sibling repositories are importable in workspace deployments.
 # robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
@@ -65,6 +77,8 @@ class VegaRobot:
         arm_side: str = "left",
         control_hz: int = 20,
         gripper_type: str = "default",
+        ik_solver_type: str = "pink",
+        robotiq_comport: str = "/dev/ttyUSB0",
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -73,6 +87,8 @@ class VegaRobot:
             raise TypeError(f"Unexpected keyword arguments: {unexpected}")
         if hand_type is not None and gripper_type == "default":
             gripper_type = hand_type
+        self._robotiq_comport = robotiq_comport
+        self._ik_solver_type = ik_solver_type
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
@@ -94,9 +110,19 @@ class VegaRobot:
         self.robot = Robot(configs=configs)
         self.arm = getattr(self.robot, f"{arm_side}_arm")
         hand_component = f"{arm_side}_hand"
-        self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
 
-        self.ik_controller = BaseIKController(bot=self.robot, visualize=False)
+        if gripper_type == "robotiq":
+            from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
+            self.hand = RobotiqGripper(comport=self._robotiq_comport)
+        else:
+            self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
+
+        custom_ik_cfg = self._build_ik_config()
+        self.ik_controller = BaseIKController(
+            bot=self.robot, visualize=False,
+            ik_solver_type=self._ik_solver_type,
+            custom_local_ik_config=custom_ik_cfg,
+        )
         self._arm_joint_names = [f"{arm_side[0].upper()}_arm_j{i + 1}" for i in range(7)]
 
         # Use Vega unfold pose (L_shape) as default reset, same as fold_robot.py unfold.
@@ -109,6 +135,35 @@ class VegaRobot:
         self._prev_command_successful = True
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
+
+    def _build_ik_config(self):
+        """Build an optimized IK config for real-time control."""
+        if self._ik_solver_type != "pink":
+            return None
+        try:
+            from dexmotion.configs.ik.ik_config import LocalPinkIKConfig, IKDampingWeightsConfig
+            return LocalPinkIKConfig(
+                solver_name="local_pink",
+                target_frames=["L_ee", "R_ee"],
+                dt=1.0 / max(1, self.control_hz),
+                avoid_self_collisions=False,
+                collision_pairs=0,
+                collision_margin=0.02,
+                qp_solver="proxqp",
+                safety_buffer=0.035,
+                damping_weights=IKDampingWeightsConfig(
+                    default=1e-12,
+                    override={
+                        "torso_j1": 30000.0,
+                        "torso_j2": 30000.0,
+                        "torso_j3": 30000.0,
+                        "R_arm_j2": 100,
+                        "L_arm_j2": 100,
+                    },
+                ),
+            )
+        except Exception:
+            return None
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -124,6 +179,9 @@ class VegaRobot:
         gripper_action_space: str = "position",
         blocking: bool = False,
     ) -> None:
+        # #region agent log
+        _uc_t0 = _time.time()
+        # #endregion
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space '{action_space}'")
         if gripper_action_space not in ("position", "velocity"):
@@ -133,6 +191,9 @@ class VegaRobot:
         dt = 1.0 / max(1, self.control_hz)
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
+        # #region agent log
+        _uc_t1 = _time.time()
+        # #endregion
 
         if action_space.startswith("joint"):
             if action.shape[0] != 8:
@@ -156,13 +217,23 @@ class VegaRobot:
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
 
+        # #region agent log
+        _uc_t2 = _time.time()
+        # #endregion
         try:
             self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
+            # #region agent log
+            _uc_t3 = _time.time()
+            # #endregion
             self.update_gripper(
                 gripper_action,
                 velocity=(gripper_action_space == "velocity"),
                 blocking=blocking,
             )
+            # #region agent log
+            _uc_t4 = _time.time()
+            _dlog("robot.py:update_cmd","uc_timing",{"get_state_ms":(_uc_t1-_uc_t0)*1000,"ik_solve_ms":(_uc_t2-_uc_t1)*1000,"update_joints_ms":(_uc_t3-_uc_t2)*1000,"update_gripper_ms":(_uc_t4-_uc_t3)*1000,"total_ms":(_uc_t4-_uc_t0)*1000},hyp="H_UC_TIMING")
+            # #endregion
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -171,12 +242,17 @@ class VegaRobot:
             self._prev_command_successful = False
             raise CommunicationFailedError(str(exc)) from exc
 
+    _MOTOR_MAX_DELTA_RAD = 0.25
+
     def update_joints(
         self,
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
     ) -> None:
+        # #region agent log
+        _uj_t0 = _time.time()
+        # #endregion
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
         if velocity:
             dt = 1.0 / max(1, self.control_hz)
@@ -184,9 +260,31 @@ class VegaRobot:
             target_joint_pos = current_joint_pos + target_joint_pos * dt
 
         self.validate_joint_limits(target_joint_pos)
-        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
-        self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
+
+        current = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        diff = target_joint_pos - current
+        max_diff = float(np.max(np.abs(diff)))
+        was_clipped = max_diff > self._MOTOR_MAX_DELTA_RAD
+        if was_clipped:
+            clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
+            target_joint_pos = current + clipped
+        # #region agent log
+        _uj_t1 = _time.time()
+        # #endregion
+
+        if blocking:
+            wait_time = 1.0 / max(1, self.control_hz)
+            self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
+        else:
+            self.arm._send_position_command(target_joint_pos)
+        # #region agent log
+        _uj_t2 = _time.time()
+        # #endregion
         self.sync_motion_manager_with_arm(target_joint_pos)
+        # #region agent log
+        _uj_t3 = _time.time()
+        _dlog("robot.py:update_joints","uj_timing",{"validate_clip_ms":(_uj_t1-_uj_t0)*1000,"send_cmd_ms":(_uj_t2-_uj_t1)*1000,"sync_mm_ms":(_uj_t3-_uj_t2)*1000,"total_ms":(_uj_t3-_uj_t0)*1000,"was_clipped":was_clipped},hyp="H_UJ_TIMING")
+        # #endregion
 
     def update_gripper(self, command: float, velocity: bool = True, blocking: bool = False) -> None:
         if self.hand is None:
@@ -215,17 +313,26 @@ class VegaRobot:
             raise
 
     def get_robot_state(self) -> tuple[dict[str, Any], dict[str, int]]:
+        # #region agent log
+        _gs_t0 = _time.time()
+        # #endregion
         joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         joint_velocities = np.asarray(self.arm.get_joint_vel(), dtype=np.float64)
         try:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
+        # #region agent log
+        _gs_t1 = _time.time()
+        # #endregion
         if self.hand is not None:
             hand_joint_pos = np.asarray(self.hand.get_joint_pos(), dtype=np.float64)
             gripper_position = float(self._normalize_gripper_position(hand_joint_pos))
         else:
             gripper_position = 0.0
+        # #region agent log
+        _gs_t2 = _time.time()
+        # #endregion
 
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:
@@ -239,6 +346,10 @@ class VegaRobot:
             "robot_timestamp_nanos": int(timestamp_ns % 1_000_000_000),
             "robot_timestamp_us": int(timestamp_ns // 1_000),
         }
+        # #region agent log
+        _gs_t3 = _time.time()
+        _dlog("robot.py:get_state","gs_timing",{"arm_queries_ms":(_gs_t1-_gs_t0)*1000,"hand_query_ms":(_gs_t2-_gs_t1)*1000,"fk_ts_ms":(_gs_t3-_gs_t2)*1000,"total_ms":(_gs_t3-_gs_t0)*1000},hyp="H_GS_TIMING")
+        # #endregion
 
         state_dict = {
             "joint_positions": joint_positions,
@@ -269,6 +380,57 @@ class VegaRobot:
                 f"Joint limit exceeded for indices {np.where(violates)[0].tolist()}"
             )
 
+    def move_to_joints_planned(
+        self,
+        target_arm_joints: np.ndarray,
+        control_frequency: float = 100.0,
+    ) -> None:
+        """Plan and execute a smooth trajectory from current to target joints."""
+        from dexmotion.utils import robot_utils
+
+        mm = self.ik_controller.motion_manager
+        actual = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        self.sync_motion_manager_with_arm(actual)
+
+        start_dict = dict(mm.get_joint_pos_dict())
+        goal_dict = dict(start_dict)
+        for i, name in enumerate(self._arm_joint_names):
+            if name in goal_dict:
+                goal_dict[name] = float(target_arm_joints[i])
+
+        waypoints = mm.plan_to_configuration(start_dict, goal_dict)
+        if waypoints is None or len(waypoints) == 0:
+            self.arm.set_joint_pos(target_arm_joints, wait_time=0.0)
+            return
+
+        wp_rows = []
+        for wp in waypoints:
+            if isinstance(wp, dict):
+                wp_rows.append(robot_utils.get_qpos_from_joint_dict(mm.pin_robot, wp))
+            else:
+                wp_rows.append(np.asarray(wp, dtype=np.float64))
+        wp_array = np.vstack(wp_rows)
+
+        traj = mm.smooth_trajectory(
+            wp_array, method="auto", control_frequency=control_frequency,
+        )
+        positions = traj.get("positions", wp_array)
+        dt = 1.0 / control_frequency
+
+        joint_names_full = list(mm.get_joint_pos_dict().keys())
+        arm_indices = [joint_names_full.index(n) for n in self._arm_joint_names if n in joint_names_full]
+
+        # #region agent log
+        _dlog("robot.py:move_planned", "traj_info", {"wp_count": len(wp_rows), "traj_len": len(positions), "dt": dt, "arm_indices": arm_indices}, hyp="H1_plan")
+        # #endregion
+
+        for pos in positions:
+            arm_pos = pos[arm_indices] if arm_indices else pos[:7]
+            self.arm.set_joint_pos(np.asarray(arm_pos, dtype=np.float64), wait_time=0.0)
+            _time.sleep(dt)
+
+        mm.set_joint_pos(goal_dict)
+
     def sync_motion_manager_with_arm(self, arm_joint_pos: np.ndarray) -> None:
         try:
             motion_manager = self.ik_controller.motion_manager
@@ -277,10 +439,32 @@ class VegaRobot:
                 if joint_name in qpos_dict:
                     qpos_dict[joint_name] = float(arm_joint_pos[i])
             motion_manager.set_joint_pos(qpos_dict)
+            # #region agent log
+            mm_after_full = np.asarray(motion_manager.get_joint_pos(), dtype=np.float64)
+            _dlog("robot.py:sync_mm","sync_done",{"target":np.asarray(arm_joint_pos),"mm_full_shape":mm_after_full.shape[0],"mm_after_full":mm_after_full},hyp="H2A")
+            # #endregion
         except Exception:
             pass
 
     def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
+        # #region agent log
+        _scd_t0 = _time.time()
+        # #endregion
+        actual_joints = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        # #region agent log
+        _scd_t1 = _time.time()
+        # #endregion
+        self.sync_motion_manager_with_arm(actual_joints)
+        # #region agent log
+        _scd_t2 = _time.time()
+        # #endregion
+        # #region agent log
+        mm_qpos_full = np.asarray(self.ik_controller.motion_manager.get_joint_pos(), dtype=np.float64)
+        cart_before_fk = self._get_cartesian_pose(actual_joints)
+        mm_arm_qpos = mm_qpos_full[:7] if self.arm_side == "left" else mm_qpos_full[7:14] if mm_qpos_full.shape[0] >= 14 else mm_qpos_full
+        cart_before_mm = self._get_cartesian_pose(mm_arm_qpos)
+        _dlog("robot.py:solve_cart","ik_input",{"delta_xyz":delta_xyz,"delta_rpy":delta_rpy,"mm_qpos_full_shape":mm_qpos_full.shape[0],"mm_arm_qpos":mm_arm_qpos,"actual_joints":actual_joints,"cart_fk_actual":cart_before_fk,"cart_fk_mm":cart_before_mm,"qpos_diff":(mm_arm_qpos-actual_joints)},hyp="H2A,H2B")
+        # #endregion
         try:
             target_joint_pos = self.ik_controller.move_delta_cartesian(
                 delta_xyz=np.asarray(delta_xyz, dtype=np.float64),
@@ -293,6 +477,14 @@ class VegaRobot:
         target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
         if target_joint_pos.shape[0] != 7:
             raise IKFailedError(f"IK returned invalid joint vector shape: {target_joint_pos.shape}")
+        # #region agent log
+        cart_after_ik = self._get_cartesian_pose(target_joint_pos)
+        cart_expected = cart_before_mm.copy()
+        cart_expected[:3] += np.asarray(delta_xyz, dtype=np.float64)
+        _scd_t3 = _time.time()
+        _dlog("robot.py:solve_cart","ik_output",{"target_joints":target_joint_pos,"cart_after_ik":cart_after_ik,"cart_expected":cart_expected,"cart_error":cart_after_ik-cart_expected,"joint_delta":target_joint_pos-mm_arm_qpos},hyp="H2A,H2B,H2C")
+        _dlog("robot.py:solve_cart","scd_timing",{"get_joints_ms":(_scd_t1-_scd_t0)*1000,"sync_mm_ms":(_scd_t2-_scd_t1)*1000,"ik_total_ms":(_scd_t3-_scd_t2)*1000,"scd_total_ms":(_scd_t3-_scd_t0)*1000},hyp="H_SCD_TIMING")
+        # #endregion
         return target_joint_pos
 
     def _init_gripper_reference(self) -> tuple[np.ndarray, np.ndarray]:
