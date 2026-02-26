@@ -189,7 +189,7 @@ class VegaRobot:
                 collision_pairs=0,
                 collision_margin=0.02,
                 qp_solver="proxqp",
-                safety_buffer=0.035,
+                safety_buffer=0.2,
                 damping_weights=IKDampingWeightsConfig(
                     default=1e-3,
                     override={

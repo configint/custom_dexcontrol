@@ -550,6 +550,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         _dlog("server.py:reset_seq","reset_done",{"target":target_f64,"actual_after":actual_after,"max_err_rad":float(np.max(err)),"err_per_joint":err,"elapsed_s":time.time()-t0},hyp="H1A,H1C")
         # #endregion
 
+    _RESET_SETTLE_TOL_RAD = 0.15  # Looser tolerance for settle-based exit
+
     def _move_incremental(
         self,
         target: np.ndarray,
@@ -559,11 +561,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         """Move to target in incremental steps respecting motor delta limit."""
         tol = tolerance if tolerance is not None else self._RESET_TOLERANCE_RAD
         t_max = timeout if timeout is not None else self._RESET_TIMEOUT_S
+        settle_tol = self._RESET_SETTLE_TOL_RAD
         target = np.asarray(target, dtype=np.float64)
         dt = 1.0 / self._RESET_CMD_HZ
         max_step = self._RESET_MAX_STEP_RAD
         deadline = time.time() + t_max
         settle_start = None
+        no_progress_start = None
 
         while time.time() < deadline:
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
@@ -590,6 +594,28 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     break
             else:
                 settle_start = None
+
+            # Detect near-target oscillation: close enough but motor jitter
+            # prevents both tight tolerance and settle from triggering.
+            if max_err < settle_tol:
+                if no_progress_start is None:
+                    no_progress_start = time.time()
+                elif time.time() - no_progress_start > 2.0:
+                    LOGGER.info(
+                        "Arm within settle tolerance (max_err=%.4f < %.4f) "
+                        "for 2s, accepting. (tight tol=%.4f)",
+                        max_err, settle_tol, tol,
+                    )
+                    break
+            else:
+                no_progress_start = None
+        else:
+            actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
+            max_err = float(np.max(np.abs(target - actual)))
+            LOGGER.warning(
+                "Reset move timed out after %.1fs (max_err=%.4f rad, tol=%.4f)",
+                t_max, max_err, tol,
+            )
 
     def _extract_target_joints(self, request) -> np.ndarray:
         if "joint_positions" not in request.params:
