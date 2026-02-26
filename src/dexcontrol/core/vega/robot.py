@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json as _json
+import logging
 import sys
 import threading
 import time as _time
@@ -10,34 +10,10 @@ from queue import Empty, Full, Queue
 from pathlib import Path
 from typing import Any, Optional
 
+_logger = logging.getLogger("robotenv_vega")
+
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-
-# #region agent log
-_DBG_LOG = "/home/dexmate/.cursor/debug-2bec47.log"
-def _dlog(loc, msg, data=None, hyp="", run=""):
-    try:
-        with open(_DBG_LOG, "a") as f:
-            f.write(_json.dumps({"sessionId":"2bec47","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(_time.time()*1000)})+"\n")
-    except Exception:
-        pass
-# #endregion
-# #region agent log
-_DBG_LOG2 = "/home/dexmate/.cursor/debug-ac3810.log"
-_clip_step_counter = [0]
-def _dlog2(loc, msg, data=None, hyp="", run=""):
-    try:
-        with open(_DBG_LOG2, "a") as f:
-            f.write(_json.dumps({"sessionId":"ac3810","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(_time.time()*1000)})+"\n")
-    except Exception:
-        pass
-# #endregion
-# #region agent log
-try:
-    _dlog2("robot.py", "module_loaded", {"robot_module_path": str(Path(__file__).resolve())}, hyp="H_LOAD")
-except Exception:
-    pass
-# #endregion
 
 # Ensure local sibling repositories are importable in workspace deployments.
 # robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
@@ -166,6 +142,9 @@ class VegaRobot:
         self._prev_controller_latency_ms = 0.0
         self._prev_joint_vel: np.ndarray | None = None
         self._vel_smoothing_alpha = 0.3  # EMA factor: 0=fully smooth, 1=no smoothing
+        self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
+        self._HW_CORRECTION_ALPHA = 0.7  # Per-step blend toward hw feedback (0=ignore hw, 1=snap to hw)
+        self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
 
         # EMA filter for joint position commands (0.0 = disabled, 0.05~0.3 = typical range)
         self._ema_alpha = float(ema_alpha)
@@ -212,6 +191,7 @@ class VegaRobot:
         if self.arm.joint_pos_limit is None:
             raise RuntimeError("Arm joint position limits are unavailable")
         self._ema_prev_qpos = None  # Reset EMA state on launch
+        self._last_cmd_joint_pos = None  # Reset command tracking on launch
         self.sync_motion_manager_with_arm(self.reset_joints)
 
     def _start_gripper_worker(self) -> None:
@@ -351,9 +331,6 @@ class VegaRobot:
         gripper_action_space: str = "position",
         blocking: bool = False,
     ) -> None:
-        # #region agent log
-        _uc_t0 = _time.time()
-        # #endregion
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space '{action_space}'")
         if gripper_action_space not in ("position", "velocity"):
@@ -363,9 +340,6 @@ class VegaRobot:
         dt = 1.0 / max(1, self.control_hz)
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
-        # #region agent log
-        _uc_t1 = _time.time()
-        # #endregion
 
         if action_space.startswith("joint"):
             if action.shape[0] != 8:
@@ -378,10 +352,6 @@ class VegaRobot:
             arm_action = action[:6]
             gripper_action = float(action[6])
 
-        # #region agent log
-        _clip_step_counter[0] += 1
-        _dlog2("robot.py:update_cmd", "action_input", {"step": _clip_step_counter[0], "action_space": action_space, "arm_action": np.asarray(arm_action), "current_joint_pos": current_joint_pos}, hyp="H1_CLIP_FREQ")
-        # #endregion
         if action_space == "joint_position":
             target_joint_pos = arm_action
         elif action_space == "joint_velocity":
@@ -404,23 +374,13 @@ class VegaRobot:
                 )
                 self._ema_prev_qpos = target_joint_pos.copy()
 
-        # #region agent log
-        _uc_t2 = _time.time()
-        # #endregion
         try:
             self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
-            # #region agent log
-            _uc_t3 = _time.time()
-            # #endregion
             self.update_gripper(
                 gripper_action,
                 velocity=(gripper_action_space == "velocity"),
                 blocking=blocking,
             )
-            # #region agent log
-            _uc_t4 = _time.time()
-            _dlog("robot.py:update_cmd","uc_timing",{"get_state_ms":(_uc_t1-_uc_t0)*1000,"ik_solve_ms":(_uc_t2-_uc_t1)*1000,"update_joints_ms":(_uc_t3-_uc_t2)*1000,"update_gripper_ms":(_uc_t4-_uc_t3)*1000,"total_ms":(_uc_t4-_uc_t0)*1000},hyp="H_UC_TIMING")
-            # #endregion
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -439,9 +399,6 @@ class VegaRobot:
         velocity: bool = False,
         blocking: bool = False,
     ) -> None:
-        # #region agent log
-        _uj_t0 = _time.time()
-        # #endregion
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
         if velocity:
             dt = 1.0 / max(1, self.control_hz)
@@ -465,25 +422,24 @@ class VegaRobot:
 
         self.validate_joint_limits(target_joint_pos)
 
-        current = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        # Gradual correction: use _last_cmd_joint_pos as the base for delta
+        # clipping, blending a fraction of hw feedback error each step to
+        # prevent drift without causing discontinuous jumps.
+        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        if self._last_cmd_joint_pos is not None:
+            raw_error = hw_pos - self._last_cmd_joint_pos
+            # Per-joint outlier rejection: skip correction for joints where
+            # hw feedback jumps beyond threshold (e.g. glitchy readings).
+            outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
+            raw_error[outlier_mask] = 0.0
+            current = self._last_cmd_joint_pos + raw_error * self._HW_CORRECTION_ALPHA
+        else:
+            current = hw_pos
         diff = target_joint_pos - current
         max_diff = float(np.max(np.abs(diff)))
-        was_clipped = max_diff > self._MOTOR_MAX_DELTA_RAD
-        if was_clipped:
+        if max_diff > self._MOTOR_MAX_DELTA_RAD:
             clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
-            # #region agent log
-            _truncated = diff - clipped
-            _per_joint_clipped = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
-            _dlog2("robot.py:update_joints", "clip_detail", {"step": _clip_step_counter[0], "max_diff_rad": max_diff, "max_diff_deg": float(np.rad2deg(max_diff)), "limit_rad": self._MOTOR_MAX_DELTA_RAD, "pct_of_motor_clip": round(100.0 * max_diff / self._MOTOR_MAX_DELTA_RAD, 2), "diff_before_rad": diff, "diff_after_rad": clipped, "truncated_rad": _truncated, "per_joint_clipped": _per_joint_clipped, "clipped_joint_indices": np.where(_per_joint_clipped)[0].tolist()}, hyp="H1_CLIP_FREQ,H2_JOINT_DIST,H3_DRIFT")
-            # #endregion
             target_joint_pos = current + clipped
-        else:
-            # #region agent log
-            _dlog2("robot.py:update_joints", "no_clip", {"step": _clip_step_counter[0], "max_diff_rad": max_diff, "max_diff_deg": float(np.rad2deg(max_diff)), "limit_rad": self._MOTOR_MAX_DELTA_RAD, "pct_of_motor_clip": round(100.0 * max_diff / self._MOTOR_MAX_DELTA_RAD, 2)}, hyp="H1_CLIP_FREQ")
-            # #endregion
-        # #region agent log
-        _uj_t1 = _time.time()
-        # #endregion
 
         if self.use_velocity_feedforward and not blocking:
             dt = 1.0 / max(1, self.control_hz)
@@ -500,14 +456,8 @@ class VegaRobot:
             self.arm.set_joint_pos(target_joint_pos, wait_time=wait_time)
         else:
             self.arm._send_position_command(target_joint_pos)
-        # #region agent log
-        _uj_t2 = _time.time()
-        # #endregion
+        self._last_cmd_joint_pos = target_joint_pos.copy()
         self.sync_motion_manager_with_arm(target_joint_pos)
-        # #region agent log
-        _uj_t3 = _time.time()
-        _dlog("robot.py:update_joints","uj_timing",{"validate_clip_ms":(_uj_t1-_uj_t0)*1000,"send_cmd_ms":(_uj_t2-_uj_t1)*1000,"sync_mm_ms":(_uj_t3-_uj_t2)*1000,"total_ms":(_uj_t3-_uj_t0)*1000,"was_clipped":was_clipped},hyp="H_UJ_TIMING")
-        # #endregion
 
     def update_gripper(self, command: float, velocity: bool = True, blocking: bool = False) -> None:
         if self.hand is None:
@@ -532,22 +482,13 @@ class VegaRobot:
         self._prev_gripper_command_successful = True
 
     def get_robot_state(self) -> tuple[dict[str, Any], dict[str, int]]:
-        # #region agent log
-        _gs_t0 = _time.time()
-        # #endregion
         joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         joint_velocities = np.asarray(self.arm.get_joint_vel(), dtype=np.float64)
         try:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
-        # #region agent log
-        _gs_t1 = _time.time()
-        # #endregion
         gripper_position = self.get_cached_gripper_position() if self.hand is not None else 0.0
-        # #region agent log
-        _gs_t2 = _time.time()
-        # #endregion
 
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:
@@ -561,10 +502,6 @@ class VegaRobot:
             "robot_timestamp_nanos": int(timestamp_ns % 1_000_000_000),
             "robot_timestamp_us": int(timestamp_ns // 1_000),
         }
-        # #region agent log
-        _gs_t3 = _time.time()
-        _dlog("robot.py:get_state","gs_timing",{"arm_queries_ms":(_gs_t1-_gs_t0)*1000,"hand_query_ms":(_gs_t2-_gs_t1)*1000,"fk_ts_ms":(_gs_t3-_gs_t2)*1000,"total_ms":(_gs_t3-_gs_t0)*1000},hyp="H_GS_TIMING")
-        # #endregion
 
         state_dict = {
             "joint_positions": joint_positions,
@@ -635,10 +572,6 @@ class VegaRobot:
         joint_names_full = list(mm.get_joint_pos_dict().keys())
         arm_indices = [joint_names_full.index(n) for n in self._arm_joint_names if n in joint_names_full]
 
-        # #region agent log
-        _dlog("robot.py:move_planned", "traj_info", {"wp_count": len(wp_rows), "traj_len": len(positions), "dt": dt, "arm_indices": arm_indices}, hyp="H1_plan")
-        # #endregion
-
         for pos in positions:
             arm_pos = pos[arm_indices] if arm_indices else pos[:7]
             self.arm.set_joint_pos(np.asarray(arm_pos, dtype=np.float64), wait_time=0.0)
@@ -660,32 +593,20 @@ class VegaRobot:
                     motion_manager.pin_robot, qpos_dict
                 )
             motion_manager.set_joint_pos(qpos_dict)
-            # #region agent log
-            mm_after_full = np.asarray(motion_manager.get_joint_pos(), dtype=np.float64)
-            _dlog("robot.py:sync_mm","sync_done",{"target":np.asarray(arm_joint_pos),"mm_full_shape":mm_after_full.shape[0],"mm_after_full":mm_after_full},hyp="H2A")
-            # #endregion
         except Exception:
             pass
 
     def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
-        # #region agent log
-        _scd_t0 = _time.time()
-        # #endregion
-        actual_joints = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
-        # #region agent log
-        _scd_t1 = _time.time()
-        # #endregion
+        # Gradual correction: use last command + outlier-rejected hw correction as IK start
+        hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
+        if self._last_cmd_joint_pos is not None:
+            raw_error = hw_pos - self._last_cmd_joint_pos
+            outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
+            raw_error[outlier_mask] = 0.0
+            actual_joints = self._last_cmd_joint_pos + raw_error * self._HW_CORRECTION_ALPHA
+        else:
+            actual_joints = hw_pos
         self.sync_motion_manager_with_arm(actual_joints)
-        # #region agent log
-        _scd_t2 = _time.time()
-        # #endregion
-        # #region agent log
-        mm_qpos_full = np.asarray(self.ik_controller.motion_manager.get_joint_pos(), dtype=np.float64)
-        cart_before_fk = self._get_cartesian_pose(actual_joints)
-        mm_arm_qpos = mm_qpos_full[:7] if self.arm_side == "left" else mm_qpos_full[7:14] if mm_qpos_full.shape[0] >= 14 else mm_qpos_full
-        cart_before_mm = self._get_cartesian_pose(mm_arm_qpos)
-        _dlog("robot.py:solve_cart","ik_input",{"delta_xyz":delta_xyz,"delta_rpy":delta_rpy,"mm_qpos_full_shape":mm_qpos_full.shape[0],"mm_arm_qpos":mm_arm_qpos,"actual_joints":actual_joints,"cart_fk_actual":cart_before_fk,"cart_fk_mm":cart_before_mm,"qpos_diff":(mm_arm_qpos-actual_joints)},hyp="H2A,H2B")
-        # #endregion
         try:
             target_joint_pos = self.ik_controller.move_delta_cartesian(
                 delta_xyz=np.asarray(delta_xyz, dtype=np.float64),
@@ -698,18 +619,6 @@ class VegaRobot:
         target_joint_pos = np.asarray(target_joint_pos, dtype=np.float64)
         if target_joint_pos.shape[0] != 7:
             raise IKFailedError(f"IK returned invalid joint vector shape: {target_joint_pos.shape}")
-        # #region agent log
-        cart_after_ik = self._get_cartesian_pose(target_joint_pos)
-        cart_expected = cart_before_mm.copy()
-        cart_expected[:3] += np.asarray(delta_xyz, dtype=np.float64)
-        _scd_t3 = _time.time()
-        _dlog("robot.py:solve_cart","ik_output",{"target_joints":target_joint_pos,"cart_after_ik":cart_after_ik,"cart_expected":cart_expected,"cart_error":cart_after_ik-cart_expected,"joint_delta":target_joint_pos-mm_arm_qpos},hyp="H2A,H2B,H2C")
-        _dlog("robot.py:solve_cart","scd_timing",{"get_joints_ms":(_scd_t1-_scd_t0)*1000,"sync_mm_ms":(_scd_t2-_scd_t1)*1000,"ik_total_ms":(_scd_t3-_scd_t2)*1000,"scd_total_ms":(_scd_t3-_scd_t0)*1000},hyp="H_SCD_TIMING")
-        # #endregion
-        # #region agent log
-        _ik_joint_delta = target_joint_pos - actual_joints
-        _dlog2("robot.py:solve_cart", "ik_result", {"step": _clip_step_counter[0], "delta_xyz": np.asarray(delta_xyz), "delta_rpy": np.asarray(delta_rpy), "delta_xyz_norm": float(np.linalg.norm(delta_xyz)), "delta_rpy_norm_deg": float(np.rad2deg(np.linalg.norm(delta_rpy))), "ik_joint_delta": _ik_joint_delta, "ik_joint_delta_abs_max": float(np.max(np.abs(_ik_joint_delta))), "ik_joint_delta_per_joint_deg": np.rad2deg(np.abs(_ik_joint_delta))}, hyp="H1_CLIP_FREQ,H2_JOINT_DIST")
-        # #endregion
         return target_joint_pos
 
     def _init_gripper_reference(self) -> tuple[np.ndarray, np.ndarray]:

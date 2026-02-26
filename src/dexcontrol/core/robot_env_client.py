@@ -306,7 +306,7 @@ class RobotEnvClient:
 
         try:
             request = robotenv_pb2.ResetRequest(mode=mode, params=params)
-            response = self.stub.Reset(request)
+            response = self.stub.Reset(request, timeout=60)
 
             if response.status != "SUCCESS":
                 print(f"[RobotEnvClient] Reset warning: {response.status} - {response.message}")

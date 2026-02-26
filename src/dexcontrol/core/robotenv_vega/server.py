@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import argparse
-import json as _json
 import logging
 import signal
 import sys
+import threading
 import time
 from concurrent import futures
 from pathlib import Path
@@ -15,25 +15,6 @@ from typing import Any, Optional
 import grpc
 import numpy as np
 from scipy.spatial.transform import Rotation as R
-
-# #region agent log
-_DBG_LOG = "/home/dexmate/.cursor/debug-2bec47.log"
-def _dlog(loc, msg, data=None, hyp="", run=""):
-    try:
-        with open(_DBG_LOG, "a") as f:
-            f.write(_json.dumps({"sessionId":"2bec47","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(time.time()*1000)})+"\n")
-    except Exception:
-        pass
-# #endregion
-# #region agent log
-_DBG_LOG_AC = "/home/dexmate/.cursor/debug-ac3810.log"
-def _dlog_ac(loc, msg, data=None, hyp="", run=""):
-    try:
-        with open(_DBG_LOG_AC, "a") as f:
-            f.write(_json.dumps({"sessionId":"ac3810","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,"tolist") else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(time.time()*1000)})+"\n")
-    except Exception:
-        pass
-# #endregion
 
 # Add package root for local imports.
 # server.py lives at: <repo>/src/dexcontrol/core/robotenv_vega/server.py
@@ -109,6 +90,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         else:
             self.R_world_to_robot = None
             self.R_robot_to_world = None
+
+        # Serialize all robot commands — prevents concurrent Reset/Step from
+        # sending conflicting position commands to the same arm.
+        self._cmd_lock = threading.Lock()
+        # Set by a new Reset to cancel any in-progress _move_incremental loop.
+        self._cancel_move = threading.Event()
 
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
@@ -306,35 +293,40 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         mode = request.mode or "home"
         LOGGER.info("Reset requested: mode=%s arm=%s", mode, self.arm_side)
 
-        try:
-            if mode == "home":
-                target_joints = self.reset_joints
-                self._execute_reset_sequence(target_joints)
-            elif mode == "target":
-                target_joints = self._extract_target_joints(request)
-                self._execute_reset_sequence(target_joints)
-            elif mode == "random":
-                target_joints = self._sample_random_target()
-                self._execute_reset_sequence(target_joints)
-            elif mode == "current":
-                pass
-            else:
-                context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
-                context.set_details(f"Unknown reset mode: {mode}")
-                return robotenv_pb2.ResetResponse()
+        # Cancel any in-progress _move_incremental from a previous Reset.
+        self._cancel_move.set()
 
-            observation, timestamp_us = self._create_observation()
-            return robotenv_pb2.ResetResponse(
-                observation=observation,
-                status="SUCCESS",
-                message=f"Reset to {mode}",
-                timestamp_us=timestamp_us,
-            )
-        except Exception as exc:
-            LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
-            context.set_code(grpc.StatusCode.INTERNAL)
-            context.set_details(f"Reset failed: {exc}")
-            return robotenv_pb2.ResetResponse()
+        with self._cmd_lock:
+            self._cancel_move.clear()
+            try:
+                if mode == "home":
+                    target_joints = self.reset_joints
+                    self._execute_reset_sequence(target_joints)
+                elif mode == "target":
+                    target_joints = self._extract_target_joints(request)
+                    self._execute_reset_sequence(target_joints)
+                elif mode == "random":
+                    target_joints = self._sample_random_target()
+                    self._execute_reset_sequence(target_joints)
+                elif mode == "current":
+                    pass
+                else:
+                    context.set_code(grpc.StatusCode.INVALID_ARGUMENT)
+                    context.set_details(f"Unknown reset mode: {mode}")
+                    return robotenv_pb2.ResetResponse()
+
+                observation, timestamp_us = self._create_observation()
+                return robotenv_pb2.ResetResponse(
+                    observation=observation,
+                    status="SUCCESS",
+                    message=f"Reset to {mode}",
+                    timestamp_us=timestamp_us,
+                )
+            except Exception as exc:
+                LOGGER.exception("Reset failed (mode=%s): %s", mode, exc)
+                context.set_code(grpc.StatusCode.INTERNAL)
+                context.set_details(f"Reset failed: {exc}")
+                return robotenv_pb2.ResetResponse()
 
     def Step(self, request, context):
         action_space = request.action_space
@@ -363,9 +355,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             )
             # -- end gripper debug --
 
-            # #region agent log
             t_step_start = time.time()
-            # #endregion
             if self.R_world_to_robot is not None and "cartesian" in action_space:
                 action = self._transform_action_to_robot_frame(action)
             if action_space == "cartesian_velocity":
@@ -374,27 +364,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 raw_rot_norm = float(np.linalg.norm(raw_action[3:6]))
                 action = self._cartesian_velocity_to_delta(action)
                 action_space_for_robot = "cartesian_delta"
-                delta_lin_norm = float(np.linalg.norm(action[:3]))
-                delta_rot_norm = float(np.linalg.norm(action[3:6]))
-                pct_lin = 100.0 * delta_lin_norm / self._max_lin_delta if self._max_lin_delta > 0 else 0.0
-                pct_rot = 100.0 * delta_rot_norm / self._max_rot_delta if self._max_rot_delta > 0 else 0.0
-                # #region agent log
-                _dlog_ac("server.py:Step", "vel_to_delta", {
-                    "raw_lin_norm": raw_lin_norm, "raw_rot_norm": raw_rot_norm,
-                    "delta_lin_norm": delta_lin_norm, "delta_rot_norm": delta_rot_norm,
-                    "max_lin_delta": self._max_lin_delta, "max_rot_delta": self._max_rot_delta,
-                    "pct_of_lin_range": round(pct_lin, 2), "pct_of_rot_range": round(pct_rot, 2),
-                    "raw_xyz": raw_action[:3].tolist(), "raw_rpy": raw_action[3:6].tolist(),
-                    "delta_xyz": action[:3].tolist(), "delta_rpy": action[3:6].tolist(),
-                }, hyp="vel_delta_analysis")
-                # #endregion
                 LOGGER.info(
                     "Converted cartesian_velocity -> cartesian_delta: lin_norm=%.4f rot_norm=%.4f max_lin_delta=%.6f max_rot_delta=%.6f",
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
-            # #region agent log
             t_after_xform = time.time()
-            # #endregion
 
             self._robot.update_command(
                 action,
@@ -402,14 +376,18 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 gripper_action_space=gripper_action_space,
                 blocking=False,
             )
-            # #region agent log
             t_after_cmd = time.time()
-            # #endregion
             observation, timestamp_us = self._create_observation()
-            # #region agent log
             t_after_obs = time.time()
-            _dlog("server.py:Step","step_timing",{"xform_ms":(t_after_xform-t_step_start)*1000,"update_cmd_ms":(t_after_cmd-t_after_xform)*1000,"create_obs_ms":(t_after_obs-t_after_cmd)*1000,"total_ms":(t_after_obs-t_step_start)*1000},hyp="H_STEP_TIMING")
-            # #endregion
+            total_ms = (t_after_obs - t_step_start) * 1000
+            if total_ms > 20:
+                LOGGER.warning(
+                    "[Step SLOW] total=%.1fms (xform=%.1f cmd=%.1f obs=%.1f)",
+                    total_ms,
+                    (t_after_xform - t_step_start) * 1000,
+                    (t_after_cmd - t_after_xform) * 1000,
+                    (t_after_obs - t_after_cmd) * 1000,
+                )
             return robotenv_pb2.StepResponse(
                 observation=observation,
                 status="SUCCESS",
@@ -531,24 +509,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
     _RESET_SETTLE_S = 0.5
 
     def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
-        # #region agent log
         t0 = time.time()
-        actual_before = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
-        _dlog("server.py:reset_seq","reset_start",{"target":target_joints,"actual_before":actual_before,"arm_side":self.arm_side},hyp="H1A,H1B,H1C")
-        # #endregion
+        LOGGER.info("Reset[%s]: starting gripper open", self.arm_side)
         self._robot.update_gripper(0.0, velocity=False, blocking=True)
+        LOGGER.info("Reset[%s]: gripper done (%.2fs), starting move_incremental", self.arm_side, time.time() - t0)
         self._robot._ema_prev_qpos = None  # Reset EMA state before reset motion
+        self._robot._last_cmd_joint_pos = None  # Reset command tracking
         target_f64 = np.asarray(target_joints, dtype=np.float64)
         self._move_incremental(target_f64)
+        LOGGER.info("Reset[%s]: move_incremental done (%.2fs), syncing motion manager", self.arm_side, time.time() - t0)
         self._robot._ema_prev_qpos = None  # Reset EMA state after reaching target
+        self._robot._last_cmd_joint_pos = None  # Reset command tracking
         self._robot.sync_motion_manager_with_arm(
             np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
         )
-        # #region agent log
-        actual_after = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
-        err = np.abs(actual_after - target_f64)
-        _dlog("server.py:reset_seq","reset_done",{"target":target_f64,"actual_after":actual_after,"max_err_rad":float(np.max(err)),"err_per_joint":err,"elapsed_s":time.time()-t0},hyp="H1A,H1C")
-        # #endregion
+        LOGGER.info("Reset[%s]: sequence complete (%.2fs)", self.arm_side, time.time() - t0)
 
     _RESET_SETTLE_TOL_RAD = 0.15  # Looser tolerance for settle-based exit
 
@@ -570,6 +545,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         no_progress_start = None
 
         while time.time() < deadline:
+            if self._cancel_move.is_set():
+                LOGGER.info("_move_incremental cancelled by new request")
+                return
+
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
             diff = target - actual
             max_err = float(np.max(np.abs(diff)))
