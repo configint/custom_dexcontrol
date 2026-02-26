@@ -46,10 +46,10 @@ except ImportError as e:
 # Robotiq 2F-85 stroke in metres
 _STROKE_M = 0.085
 
-# Predefined positions in metres (open = 0, close = max stroke)
+# Predefined positions in metres (open = max stroke, close = 0)
 _POSE_POOL = {
-    "open": np.array([0.0], dtype=np.float64),
-    "close": np.array([_STROKE_M], dtype=np.float64),
+    "open": np.array([_STROKE_M], dtype=np.float64),
+    "close": np.array([0.0], dtype=np.float64),
 }
 
 
@@ -107,14 +107,14 @@ class RobotiqGripper:
 
     def open_hand(self, wait_time: float = 0.0, **_kwargs) -> None:
         """Open the gripper fully."""
-        self._gripper.goto(pos=0.0, vel=0.05, force=50)
+        self._gripper.goto(pos=_STROKE_M, vel=0.05, force=50)
         self._gripper.sendCommand()
         if wait_time > 0.0:
             time.sleep(wait_time)
 
     def close_hand(self, wait_time: float = 0.0, **_kwargs) -> None:
         """Close the gripper fully."""
-        self._gripper.goto(pos=_STROKE_M, vel=0.05, force=50)
+        self._gripper.goto(pos=0.0, vel=0.05, force=50)
         self._gripper.sendCommand()
         if wait_time > 0.0:
             time.sleep(wait_time)

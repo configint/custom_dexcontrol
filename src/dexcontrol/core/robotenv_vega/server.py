@@ -73,6 +73,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.frame_type = frame_type
         self.control_hz = int(control_hz)
         self.base_frame_rotation = base_frame_rotation
+        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(self.control_hz)
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -103,6 +104,40 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             frame_type,
             control_hz,
         )
+        LOGGER.info(
+            "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
+            self._max_lin_delta,
+            self._max_rot_delta,
+        )
+
+    @staticmethod
+    def _compute_cartesian_delta_limits(control_hz: int) -> tuple[float, float]:
+        """Compute per-step Cartesian delta limits from control frequency."""
+        baseline_hz = 10.0
+        scale = 1.0 - (float(control_hz) - baseline_hz) / 80.0
+        # Keep behavior safe even when control_hz is unexpectedly high.
+        scale = float(np.clip(scale, 0.1, 1.5))
+        return 0.075 * scale, 0.15 * scale
+
+    def _cartesian_velocity_to_delta(self, action: np.ndarray) -> np.ndarray:
+        """Convert normalized 6D Cartesian velocity command to per-step delta."""
+        converted = np.asarray(action, dtype=np.float64).copy()
+        if converted.shape[0] < 6:
+            return converted
+
+        lin_vel = converted[:3]
+        rot_vel = converted[3:6]
+
+        lin_norm = float(np.linalg.norm(lin_vel))
+        rot_norm = float(np.linalg.norm(rot_vel))
+        if lin_norm > 1.0:
+            lin_vel = lin_vel / lin_norm
+        if rot_norm > 1.0:
+            rot_vel = rot_vel / rot_norm
+
+        converted[:3] = lin_vel * self._max_lin_delta
+        converted[3:6] = rot_vel * self._max_rot_delta
+        return converted
 
     def GetObservationSpec(self, request, context):
         del request, context
@@ -280,24 +315,55 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     def Step(self, request, context):
         action_space = request.action_space
+        action_space_for_robot = action_space
         action = np.asarray(request.action, dtype=np.float64)
         gripper_action_space = request.gripper_action_space
         if not gripper_action_space:
             gripper_action_space = "velocity" if "velocity" in action_space else "position"
 
         try:
+            # -- gripper debug --
+            if self._robot.hand is not None:
+                _cur_grip_raw = float(self._robot.hand.get_joint_pos()[0])
+                _cur_grip_norm = self._robot._normalize_gripper_position(
+                    np.asarray(self._robot.hand.get_joint_pos(), dtype=np.float64)
+                )
+            else:
+                _cur_grip_raw = 0.0
+                _cur_grip_norm = 0.0
+            if action_space.startswith("joint"):
+                _grip_cmd = float(action[7]) if action.shape[0] > 7 else 0.0
+            else:
+                _grip_cmd = float(action[6]) if action.shape[0] > 6 else 0.0
+            LOGGER.info(
+                "[Gripper] cmd=%.4f  space=%s  gripper_space=%s  cur_raw=%.4f  cur_norm=%.4f",
+                _grip_cmd, action_space, gripper_action_space, _cur_grip_raw, _cur_grip_norm,
+            )
+            # -- end gripper debug --
+
             # #region agent log
             t_step_start = time.time()
             # #endregion
             if self.R_world_to_robot is not None and "cartesian" in action_space:
                 action = self._transform_action_to_robot_frame(action)
+            if action_space == "cartesian_velocity":
+                raw_action = action.copy()
+                action = self._cartesian_velocity_to_delta(action)
+                action_space_for_robot = "cartesian_delta"
+                LOGGER.info(
+                    "Converted cartesian_velocity -> cartesian_delta: lin_norm=%.4f rot_norm=%.4f max_lin_delta=%.6f max_rot_delta=%.6f",
+                    float(np.linalg.norm(raw_action[:3])),
+                    float(np.linalg.norm(raw_action[3:6])),
+                    self._max_lin_delta,
+                    self._max_rot_delta,
+                )
             # #region agent log
             t_after_xform = time.time()
             # #endregion
 
             self._robot.update_command(
                 action,
-                action_space=action_space,
+                action_space=action_space_for_robot,
                 gripper_action_space=gripper_action_space,
                 blocking=False,
             )

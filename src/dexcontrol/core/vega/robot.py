@@ -20,6 +20,22 @@ def _dlog(loc, msg, data=None, hyp="", run=""):
     except Exception:
         pass
 # #endregion
+# #region agent log
+_DBG_LOG2 = "/home/dexmate/.cursor/debug-ac3810.log"
+_clip_step_counter = [0]
+def _dlog2(loc, msg, data=None, hyp="", run=""):
+    try:
+        with open(_DBG_LOG2, "a") as f:
+            f.write(_json.dumps({"sessionId":"ac3810","location":loc,"message":msg,"data":{k:(v.tolist() if hasattr(v,'tolist') else v) for k,v in (data or {}).items()},"hypothesisId":hyp,"runId":run,"timestamp":int(_time.time()*1000)})+"\n")
+    except Exception:
+        pass
+# #endregion
+# #region agent log
+try:
+    _dlog2("robot.py", "module_loaded", {"robot_module_path": str(Path(__file__).resolve())}, hyp="H_LOAD")
+except Exception:
+    pass
+# #endregion
 
 # Ensure local sibling repositories are importable in workspace deployments.
 # robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
@@ -206,6 +222,10 @@ class VegaRobot:
             arm_action = action[:6]
             gripper_action = float(action[6])
 
+        # #region agent log
+        _clip_step_counter[0] += 1
+        _dlog2("robot.py:update_cmd", "action_input", {"step": _clip_step_counter[0], "action_space": action_space, "arm_action": np.asarray(arm_action), "current_joint_pos": current_joint_pos}, hyp="H1_CLIP_FREQ")
+        # #endregion
         if action_space == "joint_position":
             target_joint_pos = arm_action
         elif action_space == "joint_velocity":
@@ -267,7 +287,16 @@ class VegaRobot:
         was_clipped = max_diff > self._MOTOR_MAX_DELTA_RAD
         if was_clipped:
             clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
+            # #region agent log
+            _truncated = diff - clipped
+            _per_joint_clipped = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
+            _dlog2("robot.py:update_joints", "clip_detail", {"step": _clip_step_counter[0], "max_diff_rad": max_diff, "max_diff_deg": float(np.rad2deg(max_diff)), "limit_rad": self._MOTOR_MAX_DELTA_RAD, "diff_before_rad": diff, "diff_after_rad": clipped, "truncated_rad": _truncated, "per_joint_clipped": _per_joint_clipped, "clipped_joint_indices": np.where(_per_joint_clipped)[0].tolist()}, hyp="H1_CLIP_FREQ,H2_JOINT_DIST,H3_DRIFT")
+            # #endregion
             target_joint_pos = current + clipped
+        else:
+            # #region agent log
+            _dlog2("robot.py:update_joints", "no_clip", {"step": _clip_step_counter[0], "max_diff_rad": max_diff, "max_diff_deg": float(np.rad2deg(max_diff)), "limit_rad": self._MOTOR_MAX_DELTA_RAD}, hyp="H1_CLIP_FREQ")
+            # #endregion
         # #region agent log
         _uj_t1 = _time.time()
         # #endregion
@@ -484,6 +513,10 @@ class VegaRobot:
         _scd_t3 = _time.time()
         _dlog("robot.py:solve_cart","ik_output",{"target_joints":target_joint_pos,"cart_after_ik":cart_after_ik,"cart_expected":cart_expected,"cart_error":cart_after_ik-cart_expected,"joint_delta":target_joint_pos-mm_arm_qpos},hyp="H2A,H2B,H2C")
         _dlog("robot.py:solve_cart","scd_timing",{"get_joints_ms":(_scd_t1-_scd_t0)*1000,"sync_mm_ms":(_scd_t2-_scd_t1)*1000,"ik_total_ms":(_scd_t3-_scd_t2)*1000,"scd_total_ms":(_scd_t3-_scd_t0)*1000},hyp="H_SCD_TIMING")
+        # #endregion
+        # #region agent log
+        _ik_joint_delta = target_joint_pos - actual_joints
+        _dlog2("robot.py:solve_cart", "ik_result", {"step": _clip_step_counter[0], "delta_xyz": np.asarray(delta_xyz), "delta_rpy": np.asarray(delta_rpy), "delta_xyz_norm": float(np.linalg.norm(delta_xyz)), "delta_rpy_norm_deg": float(np.rad2deg(np.linalg.norm(delta_rpy))), "ik_joint_delta": _ik_joint_delta, "ik_joint_delta_abs_max": float(np.max(np.abs(_ik_joint_delta))), "ik_joint_delta_per_joint_deg": np.rad2deg(np.abs(_ik_joint_delta))}, hyp="H1_CLIP_FREQ,H2_JOINT_DIST")
         # #endregion
         return target_joint_pos
 
