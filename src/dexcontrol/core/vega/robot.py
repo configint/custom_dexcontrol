@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import os
 import sys
 import threading
 import time as _time
@@ -77,6 +79,10 @@ class VegaRobot:
         ema_alpha: float = 0.0,
         **kwargs,
     ):
+        ik_damping_default = kwargs.pop("ik_damping_default", 1e-3)
+        ik_damping_torso = kwargs.pop("ik_damping_torso", 30000.0)
+        ik_damping_arm_j2 = kwargs.pop("ik_damping_arm_j2", 100.0)
+        ik_damping_arm_j3 = kwargs.pop("ik_damping_arm_j3", 50.0)
         hand_type = kwargs.pop("hand_type", None)
         if kwargs:
             unexpected = ", ".join(sorted(kwargs.keys()))
@@ -85,6 +91,10 @@ class VegaRobot:
             gripper_type = hand_type
         self._robotiq_comport = robotiq_comport
         self._ik_solver_type = ik_solver_type
+        self._ik_damping_default = float(ik_damping_default)
+        self._ik_damping_torso = float(ik_damping_torso)
+        self._ik_damping_arm_j2 = float(ik_damping_arm_j2)
+        self._ik_damping_arm_j3 = float(ik_damping_arm_j3)
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
@@ -157,6 +167,49 @@ class VegaRobot:
             self._refresh_gripper_state()
             self._start_gripper_worker()
 
+        # #region agent log
+        self._agent_debug_log(
+            run_id=f"joint-diagnostics-{self.arm_side}",
+            hypothesis_id="H10",
+            location="dexcontrol/core/vega/robot.py:__init__",
+            message="agent_debug_probe",
+            data={
+                "pid": int(os.getpid()),
+                "module_file": str(Path(__file__).resolve()),
+                "log_path": self._AGENT_DEBUG_LOG_PATH,
+                "arm_side": self.arm_side,
+                "control_hz": self.control_hz,
+                "ik_solver_type": self._ik_solver_type,
+                "ik_damping_default": self._ik_damping_default,
+                "ik_damping_torso": self._ik_damping_torso,
+                "ik_damping_arm_j2": self._ik_damping_arm_j2,
+                "ik_damping_arm_j3": self._ik_damping_arm_j3,
+            },
+        )
+        # #endregion
+
+    _AGENT_DEBUG_LOG_PATH = "/home/dexmate/.cursor/debug-daf7f0.log"
+    _AGENT_DEBUG_SESSION_ID = "daf7f0"
+
+    def _agent_debug_log(self, run_id: str, hypothesis_id: str, location: str, message: str, data: dict) -> None:
+        payload = {
+            "sessionId": self._AGENT_DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(_time.time() * 1000),
+        }
+        try:
+            with open(self._AGENT_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(payload, ensure_ascii=True, default=float) + "\n")
+        except Exception as exc:
+            _logger.error(
+                "[AgentDebugLogError] run_id=%s message=%s path=%s err=%s",
+                run_id, message, self._AGENT_DEBUG_LOG_PATH, exc,
+            )
+
     def _build_ik_config(self):
         """Build an optimized IK config for real-time control."""
         if self._ik_solver_type != "pink":
@@ -173,15 +226,15 @@ class VegaRobot:
                 qp_solver="proxqp",
                 safety_buffer=0.2,
                 damping_weights=IKDampingWeightsConfig(
-                    default=1e-3,
+                    default=self._ik_damping_default,
                     override={
-                        "torso_j1": 30000.0,
-                        "torso_j2": 30000.0,
-                        "torso_j3": 30000.0,
-                        "R_arm_j2": 100,
-                        "L_arm_j2": 100,
-                        "R_arm_j3": 50.0,
-                        "L_arm_j3": 50.0,
+                        "torso_j1": self._ik_damping_torso,
+                        "torso_j2": self._ik_damping_torso,
+                        "torso_j3": self._ik_damping_torso,
+                        "R_arm_j2": self._ik_damping_arm_j2,
+                        "L_arm_j2": self._ik_damping_arm_j2,
+                        "R_arm_j3": self._ik_damping_arm_j3,
+                        "L_arm_j3": self._ik_damping_arm_j3,
                     },
                 ),
             )
@@ -448,6 +501,7 @@ class VegaRobot:
         velocity: bool = False,
         blocking: bool = False,
     ) -> None:
+        run_id = f"joint-diagnostics-{self.arm_side}"
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
         if velocity:
             dt = 1.0 / max(1, self.control_hz)
@@ -470,6 +524,28 @@ class VegaRobot:
             )
 
         self.validate_joint_limits(target_joint_pos)
+        if limits is not None:
+            low = limits[:, 0].astype(np.float64)
+            high = limits[:, 1].astype(np.float64)
+            margin_low = target_joint_pos - low
+            margin_high = high - target_joint_pos
+            min_margin = float(np.minimum(margin_low, margin_high).min())
+            if min_margin < 0.08:
+                # #region agent log
+                self._agent_debug_log(
+                    run_id=run_id,
+                    hypothesis_id="H8",
+                    location="dexcontrol/core/vega/robot.py:update_joints",
+                    message="near_joint_limit",
+                    data={
+                        "arm_side": self.arm_side,
+                        "min_margin_rad": min_margin,
+                        "margin_low_min_rad": float(margin_low.min()),
+                        "margin_high_min_rad": float(margin_high.min()),
+                        "target_joint_pos": np.round(target_joint_pos, 6).tolist(),
+                    },
+                )
+                # #endregion
 
         # Gradual correction: use _last_cmd_joint_pos as the base for delta
         # clipping, blending a fraction of hw feedback error each step to
@@ -485,10 +561,26 @@ class VegaRobot:
         else:
             current = hw_pos
         diff = target_joint_pos - current
+        raw_diff = diff.copy()
         clipped_mask = np.abs(diff) > self._MOTOR_MAX_DELTA_RAD
+        clipped_count = int(np.count_nonzero(clipped_mask))
         if np.any(clipped_mask):
             clipped = np.clip(diff, -self._MOTOR_MAX_DELTA_RAD, self._MOTOR_MAX_DELTA_RAD)
             clipped_indices = np.where(clipped_mask)[0]
+            # #region agent log
+            self._agent_debug_log(
+                run_id=run_id,
+                hypothesis_id="H6",
+                location="dexcontrol/core/vega/robot.py:update_joints",
+                message="delta_clip_applied",
+                data={
+                    "arm_side": self.arm_side,
+                    "indices": clipped_indices.tolist(),
+                    "raw_delta": np.round(diff[clipped_mask], 6).tolist(),
+                    "clip_limit": self._MOTOR_MAX_DELTA_RAD[clipped_mask].tolist(),
+                },
+            )
+            # #endregion
             _logger.info(
                 "[DeltaClip] joints=%s raw=%s limit=%s",
                 clipped_indices.tolist(),
@@ -501,15 +593,48 @@ class VegaRobot:
         # Jerk limit: restrict how fast the per-step delta can change between
         # consecutive steps.  Smooths acceleration/deceleration to prevent
         # the abrupt velocity changes that cause oscillation on stop.
+        jerk_count = 0
         if self._prev_cmd_delta is not None and self._MOTOR_MAX_JERK_RAD > 0:
             accel = diff - self._prev_cmd_delta
             jerk_limit = self._MOTOR_MAX_JERK_RAD
             jerk_mask = np.abs(accel) > jerk_limit
+            jerk_count = int(np.count_nonzero(jerk_mask))
             if np.any(jerk_mask):
+                # #region agent log
+                self._agent_debug_log(
+                    run_id=run_id,
+                    hypothesis_id="H7",
+                    location="dexcontrol/core/vega/robot.py:update_joints",
+                    message="jerk_limit_applied",
+                    data={
+                        "arm_side": self.arm_side,
+                        "indices": np.where(jerk_mask)[0].tolist(),
+                        "raw_accel": np.round(accel[jerk_mask], 6).tolist(),
+                        "jerk_limit": float(jerk_limit),
+                    },
+                )
+                # #endregion
                 accel = np.clip(accel, -jerk_limit, jerk_limit)
                 diff = self._prev_cmd_delta + accel
                 target_joint_pos = current + diff
         self._prev_cmd_delta = diff.copy()
+
+        # #region agent log
+        self._agent_debug_log(
+            run_id=run_id,
+            hypothesis_id="H9",
+            location="dexcontrol/core/vega/robot.py:update_joints",
+            message="joint_update_metrics",
+            data={
+                "arm_side": self.arm_side,
+                "raw_diff_l2": float(np.linalg.norm(raw_diff)),
+                "final_diff_l2": float(np.linalg.norm(diff)),
+                "clipped_count": clipped_count,
+                "jerk_count": jerk_count,
+                "min_joint_margin_rad": min_margin if limits is not None else None,
+            },
+        )
+        # #endregion
 
         if self.use_velocity_feedforward and not blocking:
             dt = 1.0 / max(1, self.control_hz)

@@ -35,7 +35,6 @@ if str(_proto_path) not in sys.path:
 from proto import robotenv_pb2
 from proto import robotenv_pb2_grpc
 
-
 class _RobotProxy:
     """Proxy that mimics Robot for attributes accessed by policy_runner.
 

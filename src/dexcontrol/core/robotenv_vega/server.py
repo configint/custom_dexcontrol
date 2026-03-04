@@ -76,6 +76,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         ik_solver_type: str = "pink",
         robotiq_comport: str = "/dev/ttyUSB0",
         ema_alpha: float = 0.0,
+        ik_damping_default: float = 1e-3,
+        ik_damping_torso: float = 30000.0,
+        ik_damping_arm_j2: float = 100.0,
+        ik_damping_arm_j3: float = 50.0,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -103,6 +107,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ik_solver_type=ik_solver_type,
             robotiq_comport=robotiq_comport,
             ema_alpha=ema_alpha,
+            ik_damping_default=ik_damping_default,
+            ik_damping_torso=ik_damping_torso,
+            ik_damping_arm_j2=ik_damping_arm_j2,
+            ik_damping_arm_j3=ik_damping_arm_j3,
         )
         self._robot.launch_robot()
 
@@ -136,6 +144,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info(
             "Joint command mode: %s",
             "position+velocity feedforward" if self.use_velocity_feedforward else "position-only",
+        )
+        LOGGER.info(
+            "IK config: solver=%s damping(default=%.6f torso=%.1f arm_j2=%.1f arm_j3=%.1f)",
+            ik_solver_type,
+            ik_damping_default,
+            ik_damping_torso,
+            ik_damping_arm_j2,
+            ik_damping_arm_j3,
         )
         LOGGER.info(
             "Cartesian velocity normalization enabled: max_lin_delta=%.6f max_rot_delta=%.6f",
@@ -746,6 +762,10 @@ def serve(
     ik_solver_type: str = "pink",
     robotiq_comport: str = "/dev/ttyUSB0",
     ema_alpha: float = 0.0,
+    ik_damping_default: float = 1e-3,
+    ik_damping_torso: float = 30000.0,
+    ik_damping_arm_j2: float = 100.0,
+    ik_damping_arm_j3: float = 50.0,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -772,6 +792,10 @@ def serve(
         ik_solver_type=ik_solver_type,
         robotiq_comport=robotiq_comport,
         ema_alpha=ema_alpha,
+        ik_damping_default=ik_damping_default,
+        ik_damping_torso=ik_damping_torso,
+        ik_damping_arm_j2=ik_damping_arm_j2,
+        ik_damping_arm_j3=ik_damping_arm_j3,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -873,6 +897,30 @@ def main() -> None:
              "Uses a critically damped 2nd-order filter: higher = faster tracking, "
              "lower = smoother. No overshoot at any setting. (default: 0.0)",
     )
+    parser.add_argument(
+        "--ik-damping-default",
+        type=float,
+        default=1e-3,
+        help="Pink IK default damping weight (default: 1e-3)",
+    )
+    parser.add_argument(
+        "--ik-damping-torso",
+        type=float,
+        default=30000.0,
+        help="Pink IK damping override for torso_j1~j3 (default: 30000)",
+    )
+    parser.add_argument(
+        "--ik-damping-arm-j2",
+        type=float,
+        default=100.0,
+        help="Pink IK damping override for L/R_arm_j2 (default: 100)",
+    )
+    parser.add_argument(
+        "--ik-damping-arm-j3",
+        type=float,
+        default=50.0,
+        help="Pink IK damping override for L/R_arm_j3 (default: 50)",
+    )
     args = parser.parse_args()
 
     serve(
@@ -887,6 +935,10 @@ def main() -> None:
         ik_solver_type=args.ik_solver,
         robotiq_comport=args.robotiq_comport,
         ema_alpha=args.ema_alpha,
+        ik_damping_default=args.ik_damping_default,
+        ik_damping_torso=args.ik_damping_torso,
+        ik_damping_arm_j2=args.ik_damping_arm_j2,
+        ik_damping_arm_j3=args.ik_damping_arm_j3,
     )
 
 
