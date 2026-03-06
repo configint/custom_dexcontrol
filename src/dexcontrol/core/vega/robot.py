@@ -79,10 +79,6 @@ class VegaRobot:
         ema_alpha: float = 0.0,
         **kwargs,
     ):
-        ik_damping_default = kwargs.pop("ik_damping_default", 1e-3)
-        ik_damping_torso = kwargs.pop("ik_damping_torso", 30000.0)
-        ik_damping_arm_j2 = kwargs.pop("ik_damping_arm_j2", 100.0)
-        ik_damping_arm_j3 = kwargs.pop("ik_damping_arm_j3", 50.0)
         hand_type = kwargs.pop("hand_type", None)
         if kwargs:
             unexpected = ", ".join(sorted(kwargs.keys()))
@@ -91,10 +87,6 @@ class VegaRobot:
             gripper_type = hand_type
         self._robotiq_comport = robotiq_comport
         self._ik_solver_type = ik_solver_type
-        self._ik_damping_default = float(ik_damping_default)
-        self._ik_damping_torso = float(ik_damping_torso)
-        self._ik_damping_arm_j2 = float(ik_damping_arm_j2)
-        self._ik_damping_arm_j3 = float(ik_damping_arm_j3)
 
         if arm_side not in ("left", "right"):
             raise ValueError(f"arm_side must be 'left' or 'right', got: {arm_side}")
@@ -228,13 +220,13 @@ class VegaRobot:
                 damping_weights=IKDampingWeightsConfig(
                     default=self._ik_damping_default,
                     override={
-                        "torso_j1": self._ik_damping_torso,
-                        "torso_j2": self._ik_damping_torso,
-                        "torso_j3": self._ik_damping_torso,
-                        "R_arm_j2": self._ik_damping_arm_j2,
-                        "L_arm_j2": self._ik_damping_arm_j2,
-                        "R_arm_j3": self._ik_damping_arm_j3,
-                        "L_arm_j3": self._ik_damping_arm_j3,
+                        "torso_j1": 30000.0,
+                        "torso_j2": 30000.0,
+                        "torso_j3": 30000.0,
+                        "R_arm_j2": 100,
+                        "L_arm_j2": 100,
+                        "R_arm_j3": 50.0,
+                        "L_arm_j3": 50.0,
                         "R_arm_j4": 50.0,
                         "L_arm_j4": 50.0,
                         "R_arm_j5": 25.0,
