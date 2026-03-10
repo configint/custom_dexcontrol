@@ -1,0 +1,69 @@
+---
+- name: Setup host environment for Vega robot control
+  hosts: all
+  become: yes
+  vars:
+    dexmate_ip: "{{ dexmate_ip | default('192.168.5.20') }}"
+    dexmate_user: "{{ dexmate_user | default('dexmate') }}"
+    dexmate_pass: "{{ dexmate_pass | default('hello-dex') }}"
+
+  tasks:
+    # ── Teleop host setup (ds-teleop-0004-XX) ────────────────────────────────
+    - name: Install essential packages on teleop host
+      apt:
+        name:
+          - tmux
+          - vim
+          - sshpass
+          - netcat-openbsd
+        state: present
+        update_cache: yes
+
+    # ── Dexmate machine setup (192.168.5.20) ─────────────────────────────────
+    - name: Install Python dependencies on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        cd ~/custom_dexcontrol
+        pip install -e . 2>&1 | tail -5
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+
+    - name: Install Robotiq gripper dependencies on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        pip install pymodbus pyserial
+        cd ~/custom_dexcontrol
+        pip install -e robotiq_2f_85_controller/ 2>&1 | tail -5
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+
+    - name: Ensure dexmate user is in dialout group (serial port access)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'sudo usermod -aG dialout {{ dexmate_user }}'
+      args:
+        executable: /bin/bash
+      become: false
+      ignore_errors: true
+
+    - name: Set permissions on Robotiq USB serial ports on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        for dev in /dev/ttyUSB0 /dev/ttyUSB1; do
+          if [ -e "$dev" ]; then
+            sudo chmod 666 "$dev"
+          fi
+        done
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+      ignore_errors: true
+
+    - name: Display setup completion message
+      debug:
+        msg: "Host setup completed for teleop host and dexmate ({{ dexmate_ip }})"

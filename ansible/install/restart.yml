@@ -1,0 +1,125 @@
+---
+- name: Restart Vega robot gRPC servers on dexmate
+  hosts: all
+  become: yes
+  vars:
+    dexmate_ip: "{{ dexmate_ip | default('192.168.5.20') }}"
+    dexmate_user: "{{ dexmate_user | default('dexmate') }}"
+    dexmate_pass: "{{ dexmate_pass | default('hello-dex') }}"
+
+  tasks:
+    # ── Pre-flight checks ────────────────────────────────────────────────────
+    - name: Install sshpass on teleop host
+      apt:
+        name: sshpass
+        state: present
+        update_cache: false
+      become: true
+
+    - name: Ping dexmate machine ({{ dexmate_ip }})
+      shell: ping -c 3 -W 2 {{ dexmate_ip }}
+      args:
+        executable: /bin/bash
+      register: dexmate_ping
+      ignore_errors: true
+      become: false
+
+    - name: Fail if dexmate machine is unreachable
+      fail:
+        msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
+      when: dexmate_ping.rc != 0
+
+    # ── Detect ttyUSB devices ────────────────────────────────────────────────
+    - name: Check /dev/ttyUSB* devices on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} 'ls /dev/ttyUSB*'
+      args:
+        executable: /bin/bash
+      register: ttyusb_list
+      become: false
+
+    - name: Fail if fewer than 2 ttyUSB devices found
+      fail:
+        msg: "Expected 2 /dev/ttyUSB* devices, found: {{ ttyusb_list.stdout_lines }}"
+      when: ttyusb_list.stdout_lines | length < 2
+
+    - name: Resolve left/right gripper comports
+      set_fact:
+        left_gripper_port: "{{ ttyusb_list.stdout_lines | sort | first }}"
+        right_gripper_port: "{{ ttyusb_list.stdout_lines | sort | last }}"
+
+    - name: Display gripper port assignments
+      debug:
+        msg: "Left gripper: {{ left_gripper_port }} / Right gripper: {{ right_gripper_port }}"
+
+    # ── Kill existing sessions ───────────────────────────────────────────────
+    - name: Kill existing robot-server tmux session on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'tmux kill-session -t robot-server 2>/dev/null || true'
+      args:
+        executable: /bin/bash
+      become: false
+
+    # ── Start robot gRPC servers ─────────────────────────────────────────────
+    - name: Start robot-server tmux session on dexmate (left + right arm)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        tmux new-session -d -s robot-server
+        tmux send-keys -t robot-server "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+            --arm-side left \
+            --grpc-port 50061 \
+            --gripper-type robotiq \
+            --robotiq-comport {{ left_gripper_port }} \
+            --use-velocity-feedforward \
+            --ema-alpha 0.7" C-m
+        sleep 0.5
+        tmux split-window -v -t robot-server
+        tmux send-keys -t robot-server.1 "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
+            --arm-side right \
+            --grpc-port 50063 \
+            --gripper-type robotiq \
+            --robotiq-comport {{ right_gripper_port }} \
+            --use-velocity-feedforward \
+            --ema-alpha 0.7" C-m
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+
+    # ── Health checks ────────────────────────────────────────────────────────
+    - name: Wait 20 seconds for servers to initialize
+      wait_for:
+        timeout: 20
+
+    - name: Health check — left arm server (port 50061)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'nc -z {{ dexmate_ip }} 50061'
+      args:
+        executable: /bin/bash
+      register: health_left
+      become: false
+
+    - name: Health check — right arm server (port 50063)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'nc -z {{ dexmate_ip }} 50063'
+      args:
+        executable: /bin/bash
+      register: health_right
+      become: false
+
+    - name: Fail if left arm server is not listening
+      fail:
+        msg: "Left arm gRPC server (port 50061) is not listening after 20s"
+      when: health_left.rc != 0
+
+    - name: Fail if right arm server is not listening
+      fail:
+        msg: "Right arm gRPC server (port 50063) is not listening after 20s"
+      when: health_right.rc != 0
+
+    - name: Display success
+      debug:
+        msg: "Dexmate robot-server is running — left arm (50061) and right arm (50063) are healthy"

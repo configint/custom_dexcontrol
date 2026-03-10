@@ -1,0 +1,4 @@
+---
+- import_playbook: sync_project.yml
+- import_playbook: host_setup.yml
+- import_playbook: restart.yml

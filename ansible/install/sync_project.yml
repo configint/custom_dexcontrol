@@ -1,0 +1,102 @@
+---
+- name: Sync custom_dexcontrol project
+  hosts: all
+  become: yes
+  vars:
+    dexmate_ip: "{{ dexmate_ip | default('192.168.5.20') }}"
+    dexmate_user: "{{ dexmate_user | default('dexmate') }}"
+    dexmate_pass: "{{ dexmate_pass | default('hello-dex') }}"
+
+  tasks:
+    # ── Sync to teleop host (ds-teleop-0004-XX) ──────────────────────────────
+    - name: Ensure local project directory exists on teleop host
+      file:
+        path: "/home/ubuntu/custom_dexcontrol"
+        state: directory
+        mode: "0755"
+        owner: ubuntu
+        group: ubuntu
+
+    - name: Clean Python cache files before sync
+      shell: |
+        cd /home/ubuntu/custom_dexcontrol 2>/dev/null || true
+        find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+        find . -name "*.pyc" -exec rm -f {} + 2>/dev/null || true
+        find . -name "*.pyo" -exec rm -f {} + 2>/dev/null || true
+      become: yes
+      ignore_errors: yes
+
+    - name: Rsync custom_dexcontrol to teleop host
+      ansible.posix.synchronize:
+        src: "{{ ((playbook_dir + '/../..') | realpath) }}/"
+        dest: "/home/ubuntu/custom_dexcontrol/"
+        archive: true
+        delete: true
+        compress: false
+        private_key: "{{ ansible_ssh_private_key_file }}"
+        use_ssh_args: yes
+        rsync_opts:
+          - "--exclude=.git/"
+          - "--exclude=__pycache__/"
+          - "--exclude=*.pyc"
+          - "--exclude=.vscode/"
+          - "--exclude=.DS_Store"
+          - "--exclude=**/*.mp4"
+          - "--delete-excluded"
+      delegate_to: localhost
+      become: false
+      ignore_errors: true
+
+    - name: Set proper permissions for shell scripts
+      shell: |
+        find /home/ubuntu/custom_dexcontrol -name "*.sh" -exec chmod +x {} \;
+      become: false
+
+    # ── Sync to dexmate machine (192.168.5.20) ───────────────────────────────
+    - name: Install sshpass on teleop host
+      apt:
+        name: sshpass
+        state: present
+        update_cache: false
+      become: true
+
+    - name: Ping dexmate machine
+      shell: ping -c 3 -W 2 {{ dexmate_ip }}
+      args:
+        executable: /bin/bash
+      register: dexmate_ping
+      ignore_errors: true
+      become: false
+
+    - name: Fail if dexmate machine is unreachable
+      fail:
+        msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
+      when: dexmate_ping.rc != 0
+
+    - name: Ensure project directory exists on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'mkdir -p ~/custom_dexcontrol'
+      args:
+        executable: /bin/bash
+      become: false
+
+    - name: Rsync custom_dexcontrol from teleop host to dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' rsync -az --delete \
+          --exclude='.git/' \
+          --exclude='__pycache__/' \
+          --exclude='*.pyc' \
+          --exclude='.vscode/' \
+          --exclude='.DS_Store' \
+          --exclude='**/*.mp4' \
+          -e "ssh -o StrictHostKeyChecking=no" \
+          /home/ubuntu/custom_dexcontrol/ \
+          {{ dexmate_user }}@{{ dexmate_ip }}:~/custom_dexcontrol/
+      args:
+        executable: /bin/bash
+      become: false
+
+    - name: Display sync completion message
+      debug:
+        msg: "Project sync completed — teleop host and dexmate ({{ dexmate_ip }}) are up to date"
