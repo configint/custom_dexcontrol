@@ -93,6 +93,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         max_jerk: float = 0.25,
         rot_sensitivity: float = 1.0,
         vel_ratio: float = 1.0,
+        vel_damp_thresh: float = 0.05,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -133,6 +134,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             max_delta_scale=max_delta_scale,
             max_jerk=max_jerk,
             vel_ratio=vel_ratio,
+            vel_damp_thresh=vel_damp_thresh,
         )
         self._robot.launch_robot()
 
@@ -876,6 +878,7 @@ def serve(
     max_jerk: float = 0.25,
     rot_sensitivity: float = 1.0,
     vel_ratio: float = 1.0,
+    vel_damp_thresh: float = 0.05,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -919,6 +922,7 @@ def serve(
         max_jerk=max_jerk,
         rot_sensitivity=rot_sensitivity,
         vel_ratio=vel_ratio,
+        vel_damp_thresh=vel_damp_thresh,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1134,6 +1138,12 @@ def main() -> None:
         default=1.0,
         help="Velocity feedforward ratio (0.5=half speed, 1.0=full, default: 1.0)",
     )
+    parser.add_argument(
+        "--vel-damp-thresh",
+        type=float,
+        default=0.05,
+        help="Velocity damping threshold in rad. Velocity tapers to 0 within this distance (default: 0.05). Use large value like 999 to disable.",
+    )
     args = parser.parse_args()
 
     serve(
@@ -1165,6 +1175,7 @@ def main() -> None:
         max_jerk=args.max_jerk,
         rot_sensitivity=args.rot_sensitivity,
         vel_ratio=args.vel_ratio,
+        vel_damp_thresh=args.vel_damp_thresh,
     )
 
 

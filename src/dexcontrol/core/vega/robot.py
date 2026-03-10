@@ -91,6 +91,7 @@ class VegaRobot:
         max_delta_scale: float = 1.0,
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
+        vel_damp_thresh: float = 0.05,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -165,6 +166,7 @@ class VegaRobot:
         self._max_delta_scale = float(max(0.1, max_delta_scale))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
         self._vel_ratio = float(max(0.0, vel_ratio))
+        self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
 
         # Critically damped 2nd-order smoothing filter for joint commands.
         # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
@@ -831,7 +833,7 @@ class VegaRobot:
             # Per-joint velocity damping: scale down velocity when delta is small
             # to help joints settle near target without overshoot.
             pos_err = np.abs(target_joint_pos - current)
-            damp_thresh = 0.05  # rad – below this, velocity starts tapering
+            damp_thresh = self._vel_damp_thresh
             damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
             target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
             self._prev_joint_vel = target_joint_vel.copy()
