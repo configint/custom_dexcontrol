@@ -87,6 +87,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         filter_cutoff_freq: float = 10.0,
         filter_order: int = 2,
         filter_ema_alpha: float = 0.1,
+        vel_smoothing_alpha: float = 0.3,
+        hw_correction_alpha: float = 0.7,
+        max_delta_scale: float = 1.0,
+        max_jerk: float = 0.25,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -120,6 +124,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             filter_cutoff_freq=filter_cutoff_freq,
             filter_order=filter_order,
             filter_ema_alpha=filter_ema_alpha,
+            vel_smoothing_alpha=vel_smoothing_alpha,
+            hw_correction_alpha=hw_correction_alpha,
+            max_delta_scale=max_delta_scale,
+            max_jerk=max_jerk,
         )
         self._robot.launch_robot()
 
@@ -854,6 +862,10 @@ def serve(
     filter_cutoff_freq: float = 10.0,
     filter_order: int = 2,
     filter_ema_alpha: float = 0.1,
+    vel_smoothing_alpha: float = 0.3,
+    hw_correction_alpha: float = 0.7,
+    max_delta_scale: float = 1.0,
+    max_jerk: float = 0.25,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -891,6 +903,10 @@ def serve(
         filter_cutoff_freq=filter_cutoff_freq,
         filter_order=filter_order,
         filter_ema_alpha=filter_ema_alpha,
+        vel_smoothing_alpha=vel_smoothing_alpha,
+        hw_correction_alpha=hw_correction_alpha,
+        max_delta_scale=max_delta_scale,
+        max_jerk=max_jerk,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1070,6 +1086,30 @@ def main() -> None:
         default=0.1,
         help="EMA filter alpha (0=fully smooth, 1=no smoothing) when --filter-type=ema (default: 0.1)",
     )
+    parser.add_argument(
+        "--vel-smoothing-alpha",
+        type=float,
+        default=0.3,
+        help="Velocity feedforward EMA factor (0=fully smooth, 1=no smoothing, default: 0.3)",
+    )
+    parser.add_argument(
+        "--hw-correction-alpha",
+        type=float,
+        default=0.7,
+        help="HW feedback correction blend (0=ignore hw, 1=snap to hw, default: 0.7)",
+    )
+    parser.add_argument(
+        "--max-delta-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for per-joint max delta clipping (>1=faster, <1=slower, default: 1.0)",
+    )
+    parser.add_argument(
+        "--max-jerk",
+        type=float,
+        default=0.25,
+        help="Max jerk (rad/step^2) for acceleration limiting (0=disable, default: 0.25)",
+    )
     args = parser.parse_args()
 
     serve(
@@ -1095,6 +1135,10 @@ def main() -> None:
         filter_cutoff_freq=args.filter_cutoff_freq,
         filter_order=args.filter_order,
         filter_ema_alpha=args.filter_ema_alpha,
+        vel_smoothing_alpha=args.vel_smoothing_alpha,
+        hw_correction_alpha=args.hw_correction_alpha,
+        max_delta_scale=args.max_delta_scale,
+        max_jerk=args.max_jerk,
     )
 
 

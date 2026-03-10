@@ -86,6 +86,10 @@ class VegaRobot:
         filter_cutoff_freq: float = 10.0,
         filter_order: int = 2,
         filter_ema_alpha: float = 0.1,
+        vel_smoothing_alpha: float = 0.3,
+        hw_correction_alpha: float = 0.7,
+        max_delta_scale: float = 1.0,
+        max_jerk: float = 0.25,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -152,11 +156,13 @@ class VegaRobot:
         self._prev_gripper_command_successful = True
         self._prev_controller_latency_ms = 0.0
         self._prev_joint_vel: np.ndarray | None = None
-        self._vel_smoothing_alpha = 0.3  # EMA factor: 0=fully smooth, 1=no smoothing
+        self._vel_smoothing_alpha = float(np.clip(vel_smoothing_alpha, 0.0, 1.0))
         self._last_cmd_joint_pos: np.ndarray | None = None  # Track last sent command for delta clipping
         self._prev_cmd_delta: np.ndarray | None = None  # Previous step delta for jerk limiting
-        self._HW_CORRECTION_ALPHA = 0.7  # Per-step blend toward hw feedback (0=ignore hw, 1=snap to hw)
+        self._HW_CORRECTION_ALPHA = float(np.clip(hw_correction_alpha, 0.0, 1.0))
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
+        self._max_delta_scale = float(max(0.1, max_delta_scale))
+        self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
 
         # Critically damped 2nd-order smoothing filter for joint commands.
         # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
@@ -655,7 +661,7 @@ class VegaRobot:
     # j1-j3 (shoulder/base) are kept conservative; j4-j7 (elbow/wrist)
     # get larger limits because the IK solver assigns them larger deltas
     # due to their lower damping weights.
-    _MOTOR_MAX_DELTA_RAD = np.array([
+    _MOTOR_MAX_DELTA_RAD_BASE = np.array([
         0.35,   # j1 – base rotation
         0.35,   # j2 – shoulder
         0.35,   # j3 – shoulder
@@ -665,9 +671,9 @@ class VegaRobot:
         0.6,    # j7 – wrist
     ], dtype=np.float64)
 
-    # Maximum change in velocity per step (jerk limit in rad/step^2).
-    # Prevents abrupt acceleration/deceleration that causes oscillation.
-    _MOTOR_MAX_JERK_RAD = 0.25
+    @property
+    def _MOTOR_MAX_DELTA_RAD(self) -> np.ndarray:
+        return self._MOTOR_MAX_DELTA_RAD_BASE * self._max_delta_scale
 
     _JOINT_LIMIT_TOLERANCE_RAD = 0.01  # ~0.57 deg tolerance for IK numerical precision
 
