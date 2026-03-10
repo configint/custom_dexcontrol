@@ -105,7 +105,19 @@ class TrajectoryInterpolator:
         t_span = self._interpolators["t_span"]
 
         rel_t = query_time - t0
-        # Clamp into [small_margin, t_span] to avoid extrapolation.
+
+        # If query_time is past the last data point, return the latest
+        # position with zero velocity.  This prevents the "stutter"
+        # artefact where the robot sits at a clamped position then
+        # suddenly jumps when a new input arrives.
+        if rel_t >= t_span:
+            pos = self._positions[-1].copy()
+            vel = np.zeros_like(pos) if compute_velocity else None
+            self._prev_positions = pos.copy()
+            self._prev_time = query_time
+            return pos, vel
+
+        # Clamp into [small_margin, t_span) for valid interpolation.
         margin = 1e-4
         clamped = float(np.clip(rel_t, margin, max(t_span - margin, margin + 1e-4)))
 
