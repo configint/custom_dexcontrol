@@ -80,6 +80,20 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         ik_damping_torso: float = 30000.0,
         ik_damping_arm_j2: float = 100.0,
         ik_damping_arm_j3: float = 50.0,
+        interpolation_method: str = "none",
+        interpolation_history: int = 4,
+        control_loop_hz: int = 0,
+        filter_type: str = "none",
+        filter_cutoff_freq: float = 10.0,
+        filter_order: int = 2,
+        filter_ema_alpha: float = 0.1,
+        vel_smoothing_alpha: float = 0.3,
+        hw_correction_alpha: float = 0.7,
+        max_delta_scale: float = 1.0,
+        max_jerk: float = 0.25,
+        rot_sensitivity: float = 1.0,
+        vel_ratio: float = 1.0,
+        vel_damp_thresh: float = 0.05,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -96,7 +110,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.control_hz = int(control_hz)
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
-        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(self.control_hz)
+        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
+            self.control_hz, rot_sensitivity=rot_sensitivity,
+        )
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -107,8 +123,36 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ik_solver_type=ik_solver_type,
             robotiq_comport=robotiq_comport,
             ema_alpha=ema_alpha,
+            interpolation_method=interpolation_method,
+            interpolation_history=interpolation_history,
+            filter_type=filter_type,
+            filter_cutoff_freq=filter_cutoff_freq,
+            filter_order=filter_order,
+            filter_ema_alpha=filter_ema_alpha,
+            vel_smoothing_alpha=vel_smoothing_alpha,
+            hw_correction_alpha=hw_correction_alpha,
+            max_delta_scale=max_delta_scale,
+            max_jerk=max_jerk,
+            vel_ratio=vel_ratio,
+            vel_damp_thresh=vel_damp_thresh,
         )
         self._robot.launch_robot()
+
+        # --- Background control loop for interpolation-based upsampling ---
+        # When interpolation is active, gRPC Step() buffers commands at
+        # input rate and this thread dispatches them to hardware at
+        # control_loop_hz (typically 100 Hz).
+        self._control_loop_hz = control_loop_hz if control_loop_hz > 0 else 0
+        self._control_loop_thread: Optional[threading.Thread] = None
+        self._control_loop_stop = threading.Event()
+        if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+            self._start_control_loop()
+            LOGGER.info(
+                "Control loop thread started: %d Hz (input≈%d Hz → control=%d Hz)",
+                self._control_loop_hz,
+                control_hz,
+                self._control_loop_hz,
+            )
 
         # Override home position with per-arm init joints.
         self.reset_joints = _INIT_JOINTS[arm_side].copy()
@@ -167,14 +211,55 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Moving to init position on startup (arm=%s)", arm_side)
         self._execute_reset_sequence(self.reset_joints)
 
+    # ------------------------------------------------------------------
+    # Background control loop (for interpolation upsampling)
+    # ------------------------------------------------------------------
+
+    def _start_control_loop(self) -> None:
+        """Start the background control-loop thread."""
+        if self._control_loop_thread is not None:
+            return
+        self._control_loop_stop.clear()
+        self._control_loop_thread = threading.Thread(
+            target=self._control_loop_run,
+            name=f"ctrl-loop-{self.arm_side}",
+            daemon=True,
+        )
+        self._control_loop_thread.start()
+
+    def _stop_control_loop(self) -> None:
+        """Stop the background control-loop thread."""
+        self._control_loop_stop.set()
+        if self._control_loop_thread is not None and self._control_loop_thread.is_alive():
+            self._control_loop_thread.join(timeout=2.0)
+        self._control_loop_thread = None
+
+    def _control_loop_run(self) -> None:
+        """Main loop: dispatch interpolated commands at control rate."""
+        dt = 1.0 / self._control_loop_hz
+        LOGGER.info("Control loop running at %d Hz", self._control_loop_hz)
+        while not self._control_loop_stop.is_set():
+            t0 = time.perf_counter()
+            try:
+                self._robot.execute_interpolated_tick()
+            except Exception as exc:
+                LOGGER.error("Control loop tick error: %s", exc)
+            elapsed = time.perf_counter() - t0
+            sleep_time = dt - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
     @staticmethod
-    def _compute_cartesian_delta_limits(control_hz: int) -> tuple[float, float]:
+    def _compute_cartesian_delta_limits(
+        control_hz: int,
+        rot_sensitivity: float = 1.0,
+    ) -> tuple[float, float]:
         """Compute per-step Cartesian delta limits from control frequency."""
         baseline_hz = 10.0
         scale = 1.0 - (float(control_hz) - baseline_hz) / 80.0
         # Keep behavior safe even when control_hz is unexpectedly high.
         scale = float(np.clip(scale, 0.1, 1.5))
-        return 0.075 * scale, 0.3 * scale
+        return 0.075 * scale, 0.3 * scale * rot_sensitivity
 
     def _cartesian_velocity_to_delta(self, action: np.ndarray) -> np.ndarray:
         """Convert normalized 6D Cartesian velocity command to per-step delta."""
@@ -343,6 +428,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Cancel any in-progress _move_incremental from a previous Reset.
         self._cancel_move.set()
 
+        # Pause the control loop during reset to prevent conflicting commands.
+        was_running = self._control_loop_thread is not None and self._control_loop_thread.is_alive()
+        if was_running:
+            self._stop_control_loop()
+
         with self._cmd_lock:
             self._cancel_move.clear()
             try:
@@ -374,6 +464,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 context.set_code(grpc.StatusCode.INTERNAL)
                 context.set_details(f"Reset failed: {exc}")
                 return robotenv_pb2.ResetResponse()
+            finally:
+                # Restart control loop if it was running before reset.
+                if was_running:
+                    self._start_control_loop()
 
     def Step(self, request, context):
         action_space = request.action_space
@@ -420,12 +514,21 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # Get robot_state BEFORE executing action (needed for create_action_dict)
             pre_action_state, _ = self._robot.get_robot_state()
 
-            self._robot.update_command(
-                action,
-                action_space=action_space_for_robot,
-                gripper_action_space=gripper_action_space,
-                blocking=False,
-            )
+            if self._robot.interpolation_enabled and self._control_loop_hz > 0:
+                # Interpolation mode: buffer command; control loop dispatches.
+                self._robot.add_command_point(
+                    action,
+                    action_space=action_space_for_robot,
+                    gripper_action_space=gripper_action_space,
+                )
+            else:
+                # Legacy synchronous path.
+                self._robot.update_command(
+                    action,
+                    action_space=action_space_for_robot,
+                    gripper_action_space=gripper_action_space,
+                    blocking=False,
+                )
             t_after_cmd = time.time()
 
             # Build comprehensive action_info using the original request action_space
@@ -762,6 +865,20 @@ def serve(
     ik_damping_torso: float = 30000.0,
     ik_damping_arm_j2: float = 100.0,
     ik_damping_arm_j3: float = 50.0,
+    interpolation_method: str = "none",
+    interpolation_history: int = 4,
+    control_loop_hz: int = 0,
+    filter_type: str = "none",
+    filter_cutoff_freq: float = 10.0,
+    filter_order: int = 2,
+    filter_ema_alpha: float = 0.1,
+    vel_smoothing_alpha: float = 0.3,
+    hw_correction_alpha: float = 0.7,
+    max_delta_scale: float = 1.0,
+    max_jerk: float = 0.25,
+    rot_sensitivity: float = 1.0,
+    vel_ratio: float = 1.0,
+    vel_damp_thresh: float = 0.05,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -792,6 +909,20 @@ def serve(
         ik_damping_torso=ik_damping_torso,
         ik_damping_arm_j2=ik_damping_arm_j2,
         ik_damping_arm_j3=ik_damping_arm_j3,
+        interpolation_method=interpolation_method,
+        interpolation_history=interpolation_history,
+        control_loop_hz=control_loop_hz,
+        filter_type=filter_type,
+        filter_cutoff_freq=filter_cutoff_freq,
+        filter_order=filter_order,
+        filter_ema_alpha=filter_ema_alpha,
+        vel_smoothing_alpha=vel_smoothing_alpha,
+        hw_correction_alpha=hw_correction_alpha,
+        max_delta_scale=max_delta_scale,
+        max_jerk=max_jerk,
+        rot_sensitivity=rot_sensitivity,
+        vel_ratio=vel_ratio,
+        vel_damp_thresh=vel_damp_thresh,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -811,6 +942,10 @@ def serve(
     def shutdown_handler(signum, frame):
         del signum, frame
         LOGGER.info("Shutting down Vega RobotEnv server")
+        try:
+            service._stop_control_loop()
+        except Exception:
+            pass
         try:
             service._robot.close()
         except Exception:
@@ -917,6 +1052,98 @@ def main() -> None:
         default=50.0,
         help="Pink IK damping override for L/R_arm_j3 (default: 50)",
     )
+    # --- Interpolation & filtering ---
+    parser.add_argument(
+        "--interpolation-method",
+        type=str,
+        default="none",
+        choices=["none", "linear", "cubic"],
+        help="Trajectory interpolation method for input→control rate upsampling. "
+             "'cubic' uses PCHIP (monotone, C1-continuous, no overshoot). "
+             "(default: none = legacy synchronous path)",
+    )
+    parser.add_argument(
+        "--interpolation-history",
+        type=int,
+        default=4,
+        help="Number of past command points to keep for interpolation (default: 4)",
+    )
+    parser.add_argument(
+        "--control-loop-hz",
+        type=int,
+        default=0,
+        help="Control loop frequency for interpolation upsampling. "
+             "Set to e.g. 100 when using --interpolation-method. "
+             "0 = no background loop (default: 0)",
+    )
+    parser.add_argument(
+        "--filter-type",
+        type=str,
+        default="none",
+        choices=["none", "butterworth", "ema"],
+        help="Output filter applied after interpolation/EMA smoothing. "
+             "(default: none)",
+    )
+    parser.add_argument(
+        "--filter-cutoff-freq",
+        type=float,
+        default=10.0,
+        help="Butterworth filter cutoff frequency in Hz (default: 10.0)",
+    )
+    parser.add_argument(
+        "--filter-order",
+        type=int,
+        default=2,
+        help="Butterworth filter order (default: 2)",
+    )
+    parser.add_argument(
+        "--filter-ema-alpha",
+        type=float,
+        default=0.1,
+        help="EMA filter alpha (0=fully smooth, 1=no smoothing) when --filter-type=ema (default: 0.1)",
+    )
+    parser.add_argument(
+        "--vel-smoothing-alpha",
+        type=float,
+        default=0.3,
+        help="Velocity feedforward EMA factor (0=fully smooth, 1=no smoothing, default: 0.3)",
+    )
+    parser.add_argument(
+        "--hw-correction-alpha",
+        type=float,
+        default=0.7,
+        help="HW feedback correction blend (0=ignore hw, 1=snap to hw, default: 0.7)",
+    )
+    parser.add_argument(
+        "--max-delta-scale",
+        type=float,
+        default=1.0,
+        help="Scale factor for per-joint max delta clipping (>1=faster, <1=slower, default: 1.0)",
+    )
+    parser.add_argument(
+        "--max-jerk",
+        type=float,
+        default=0.25,
+        help="Max jerk (rad/step^2) for acceleration limiting (0=disable, default: 0.25)",
+    )
+    parser.add_argument(
+        "--rot-sensitivity",
+        type=float,
+        default=1.0,
+        help="RPY rotation sensitivity multiplier (>1=more sensitive, default: 1.0)",
+    )
+    parser.add_argument(
+        "--vel-ratio",
+        type=float,
+        default=1.0,
+        help="Velocity feedforward ratio (0.5=half speed, 1.0=full, default: 1.0)",
+    )
+    parser.add_argument(
+        "--vel-damp-thresh",
+        type=float,
+        default=0.05,
+        help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
+    )
     args = parser.parse_args()
 
     serve(
@@ -935,6 +1162,20 @@ def main() -> None:
         ik_damping_torso=args.ik_damping_torso,
         ik_damping_arm_j2=args.ik_damping_arm_j2,
         ik_damping_arm_j3=args.ik_damping_arm_j3,
+        interpolation_method=args.interpolation_method,
+        interpolation_history=args.interpolation_history,
+        control_loop_hz=args.control_loop_hz,
+        filter_type=args.filter_type,
+        filter_cutoff_freq=args.filter_cutoff_freq,
+        filter_order=args.filter_order,
+        filter_ema_alpha=args.filter_ema_alpha,
+        vel_smoothing_alpha=args.vel_smoothing_alpha,
+        hw_correction_alpha=args.hw_correction_alpha,
+        max_delta_scale=args.max_delta_scale,
+        max_jerk=args.max_jerk,
+        rot_sensitivity=args.rot_sensitivity,
+        vel_ratio=args.vel_ratio,
+        vel_damp_thresh=args.vel_damp_thresh,
     )
 
 

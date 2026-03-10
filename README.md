@@ -53,6 +53,118 @@ robot = VegaRobot(
 )
 ```
 
+## Trajectory Interpolation & Control Tuning
+
+`feature/interpolation-controller-upgrade` branch adds trajectory interpolation, output filtering, and runtime-tunable motor control parameters adapted from the official omniteleop `RobotController`.
+
+### Architecture
+
+```
+gRPC Step() (~20Hz)              Background Control Loop (100Hz)
+     |                                    |
+     v                                    v
+add_command_point()              execute_interpolated_tick()
+     |                                    |
+     v                                    v
+TrajectoryInterpolator           interpolate(now) -> pos, vel
+  (PCHIP cubic / linear)                  |
+                                          v
+                                  MultiChannelFilter
+                                  (Butterworth / EMA)
+                                          |
+                                          v
+                                  update_joints() -> hardware
+                                  (delta clip, jerk limit,
+                                   hw correction, vel feedforward)
+```
+
+### Launch Example (dual-arm with Robotiq)
+
+```bash
+# Left arm
+python src/dexcontrol/core/robotenv_vega/server.py \
+    --arm-side left \
+    --grpc-port 50061 \
+    --gripper-type robotiq \
+    --robotiq-comport /dev/ttyUSB0 \
+    --use-velocity-feedforward \
+    --interpolation-method cubic \
+    --interpolation-history 3 \
+    --control-loop-hz 100 \
+    --filter-type butterworth \
+    --filter-cutoff-freq 15.0 \
+    --vel-smoothing-alpha 0.15 \
+    --hw-correction-alpha 0.4 \
+    --max-jerk 0.15
+
+# Right arm
+python src/dexcontrol/core/robotenv_vega/server.py \
+    --arm-side right \
+    --grpc-port 50063 \
+    --gripper-type robotiq \
+    --robotiq-comport /dev/ttyUSB1 \
+    --use-velocity-feedforward \
+    --interpolation-method cubic \
+    --interpolation-history 3 \
+    --control-loop-hz 100 \
+    --filter-type butterworth \
+    --filter-cutoff-freq 15.0 \
+    --vel-smoothing-alpha 0.15 \
+    --hw-correction-alpha 0.4 \
+    --max-jerk 0.15
+```
+
+### CLI Parameters
+
+#### Interpolation
+
+| Flag | Default | Description |
+|---|---|---|
+| `--interpolation-method` | `none` | `none`, `linear`, `cubic` (PCHIP). `cubic` requires >= 4 history points |
+| `--interpolation-history` | `4` | Number of past input points for interpolation (min: 2) |
+| `--control-loop-hz` | `0` | Background control loop rate. 0 = disabled (legacy sync path) |
+
+#### Output Filter (applied after interpolation)
+
+| Flag | Default | Description |
+|---|---|---|
+| `--filter-type` | `none` | `none`, `butterworth`, `ema` |
+| `--filter-cutoff-freq` | `10.0` | Butterworth cutoff frequency (Hz). Higher = faster response |
+| `--filter-order` | `2` | Butterworth filter order |
+| `--filter-ema-alpha` | `0.1` | EMA alpha when `--filter-type=ema` |
+
+#### Motor Control Tuning
+
+| Flag | Default | Description |
+|---|---|---|
+| `--vel-smoothing-alpha` | `0.3` | Velocity feedforward EMA (0=smooth, 1=raw). Lower = smoother velocity |
+| `--hw-correction-alpha` | `0.7` | HW feedback correction blend (0=ignore hw, 1=snap to hw). Lower = less position correction |
+| `--max-delta-scale` | `1.0` | Scale factor for per-joint max delta clipping. >1 = allow larger steps |
+| `--max-jerk` | `0.25` | Max acceleration change per step (rad/step^2). 0 = disable jerk limiting |
+
+### Tuning Guide
+
+| Goal | Key flags |
+|---|---|
+| Faster response | `--filter-cutoff-freq 20` `--interpolation-history 3` |
+| Smoother motion | `--filter-cutoff-freq 5` `--vel-smoothing-alpha 0.1` `--max-jerk 0.15` |
+| Less HW correction drift | `--hw-correction-alpha 0.3` |
+| Disable filtering (interp only) | `--filter-type none` |
+| Legacy mode (no interp) | Omit `--interpolation-method` and `--control-loop-hz` |
+
+### Reference: Official omniteleop defaults (Vega YAML)
+
+| Component | Filter | cutoff_freq | order |
+|---|---|---|---|
+| left_arm / right_arm | butterworth | 3.0 Hz | 2 |
+| torso | butterworth | 5.0 Hz | 2 |
+| left_hand / right_hand | butterworth | 8.0 Hz | 2 |
+| chassis | butterworth | 5.0 Hz | 2 |
+
+Note: The official config uses very conservative cutoff (3Hz for arms) designed for deployed production. For development/teleop, 8-15Hz is more practical.
+
+---
+
 ## ⚠️ Version Compatibility
 
 **Important:** `dexcontrol >= 0.4.0` requires robot firmware `>= 0.4.0`. Using older firmware with this version will not work.
