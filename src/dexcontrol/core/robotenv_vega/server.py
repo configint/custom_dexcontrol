@@ -91,6 +91,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         hw_correction_alpha: float = 0.7,
         max_delta_scale: float = 1.0,
         max_jerk: float = 0.25,
+        rot_sensitivity: float = 1.0,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -107,7 +108,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self.control_hz = int(control_hz)
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
         self.base_frame_rotation = base_frame_rotation
-        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(self.control_hz)
+        self._max_lin_delta, self._max_rot_delta = self._compute_cartesian_delta_limits(
+            self.control_hz, rot_sensitivity=rot_sensitivity,
+        )
 
         self._robot = VegaRobot(
             robot_model=robot_model,
@@ -243,13 +246,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 time.sleep(sleep_time)
 
     @staticmethod
-    def _compute_cartesian_delta_limits(control_hz: int) -> tuple[float, float]:
+    def _compute_cartesian_delta_limits(
+        control_hz: int,
+        rot_sensitivity: float = 1.0,
+    ) -> tuple[float, float]:
         """Compute per-step Cartesian delta limits from control frequency."""
         baseline_hz = 10.0
         scale = 1.0 - (float(control_hz) - baseline_hz) / 80.0
         # Keep behavior safe even when control_hz is unexpectedly high.
         scale = float(np.clip(scale, 0.1, 1.5))
-        return 0.075 * scale, 0.3 * scale
+        return 0.075 * scale, 0.3 * scale * rot_sensitivity
 
     def _cartesian_velocity_to_delta(self, action: np.ndarray) -> np.ndarray:
         """Convert normalized 6D Cartesian velocity command to per-step delta."""
@@ -866,6 +872,7 @@ def serve(
     hw_correction_alpha: float = 0.7,
     max_delta_scale: float = 1.0,
     max_jerk: float = 0.25,
+    rot_sensitivity: float = 1.0,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -907,6 +914,7 @@ def serve(
         hw_correction_alpha=hw_correction_alpha,
         max_delta_scale=max_delta_scale,
         max_jerk=max_jerk,
+        rot_sensitivity=rot_sensitivity,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1110,6 +1118,12 @@ def main() -> None:
         default=0.25,
         help="Max jerk (rad/step^2) for acceleration limiting (0=disable, default: 0.25)",
     )
+    parser.add_argument(
+        "--rot-sensitivity",
+        type=float,
+        default=1.0,
+        help="RPY rotation sensitivity multiplier (>1=more sensitive, default: 1.0)",
+    )
     args = parser.parse_args()
 
     serve(
@@ -1139,6 +1153,7 @@ def main() -> None:
         hw_correction_alpha=args.hw_correction_alpha,
         max_delta_scale=args.max_delta_scale,
         max_jerk=args.max_jerk,
+        rot_sensitivity=args.rot_sensitivity,
     )
 
 
