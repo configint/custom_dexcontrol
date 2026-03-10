@@ -284,18 +284,20 @@ class VegaRobot:
                         "torso_j1": 30000.0,
                         "torso_j2": 30000.0,
                         "torso_j3": 30000.0,
+                        "R_arm_j1": 50,
+                        "L_arm_j1": 50,
                         "R_arm_j2": 100,
                         "L_arm_j2": 100,
                         "R_arm_j3": 50.0,
                         "L_arm_j3": 50.0,
                         "R_arm_j4": 50.0,
                         "L_arm_j4": 50.0,
-                        "R_arm_j5": 25.0,
-                        "L_arm_j5": 25.0,
-                        "R_arm_j6": 50.0,
-                        "L_arm_j6": 50.0,
-                        "R_arm_j7": 50.0,
-                        "L_arm_j7": 50.0,
+                        "R_arm_j5": 120.0,
+                        "L_arm_j5": 120.0,
+                        "R_arm_j6": 120.0,
+                        "L_arm_j6": 120.0,
+                        "R_arm_j7": 120.0,
+                        "L_arm_j7": 120.0,
                     },
                 ),
             )
@@ -1188,6 +1190,11 @@ class VegaRobot:
             # Stop arm motion by sending current position as target
             current_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
             self.arm.set_joint_pos(current_pos, wait_time=0.0)
+        except Exception:
+            pass
+        try:
+            # Stop chassis wheels
+            self.robot.chassis.stop()
         except Exception:
             pass
 
