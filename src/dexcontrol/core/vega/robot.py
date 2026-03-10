@@ -17,6 +17,9 @@ _logger = logging.getLogger("robotenv_vega")
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
+from dexcontrol.utils.trajectory_interpolator import TrajectoryInterpolator
+from dexcontrol.utils.filters import MultiChannelFilter
+
 # Ensure local sibling repositories are importable in workspace deployments.
 # robot.py lives at: <repo>/src/dexcontrol/core/vega/robot.py
 #   parents: [0]=vega, [1]=core, [2]=dexcontrol, [3]=src, [4]=<repo>
@@ -77,6 +80,12 @@ class VegaRobot:
         use_velocity_feedforward: bool = False,
         robotiq_comport: str = "/dev/ttyUSB0",
         ema_alpha: float = 0.0,
+        interpolation_method: str = "none",
+        interpolation_history: int = 4,
+        filter_type: str = "none",
+        filter_cutoff_freq: float = 10.0,
+        filter_order: int = 2,
+        filter_ema_alpha: float = 0.1,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -154,6 +163,52 @@ class VegaRobot:
         self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
         self._filter_pos: np.ndarray | None = None
         self._filter_vel: np.ndarray | None = None
+
+        # --- Trajectory interpolation (input-rate → control-rate upsampling) ---
+        # When interpolation_method != "none", incoming commands are buffered
+        # via add_command_point() and the control loop calls
+        # get_interpolated_command() at a higher rate for smooth output.
+        self._interpolation_method = interpolation_method
+        if interpolation_method != "none":
+            self._interpolator = TrajectoryInterpolator(
+                method=interpolation_method,
+                history_size=interpolation_history,
+            )
+            _logger.info(
+                "Trajectory interpolation enabled: method=%s history=%d",
+                interpolation_method,
+                interpolation_history,
+            )
+        else:
+            self._interpolator = None
+
+        # --- Output filter (applied after interpolation / EMA) ---
+        if filter_type != "none":
+            filter_cfg = {"default": {"type": filter_type}}
+            if filter_type == "butterworth":
+                filter_cfg["default"]["cutoff_freq"] = filter_cutoff_freq
+                filter_cfg["default"]["order"] = filter_order
+            elif filter_type == "ema":
+                filter_cfg["default"]["alpha"] = filter_ema_alpha
+            self._output_filter = MultiChannelFilter(
+                filter_config=filter_cfg,
+                control_rate=float(control_hz),
+            )
+            _logger.info(
+                "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
+                filter_type,
+                filter_cutoff_freq,
+                filter_order,
+                filter_ema_alpha,
+            )
+        else:
+            self._output_filter = None
+
+        # Latest raw command stored by add_command_point for the control loop
+        self._latest_target_joint_pos: np.ndarray | None = None
+        self._latest_gripper_action: float = 0.0
+        self._latest_gripper_action_space: str = "position"
+        self._interp_lock = threading.Lock()
 
         if self.hand is not None:
             self._refresh_gripper_state()
@@ -247,6 +302,11 @@ class VegaRobot:
         self._filter_vel = None
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
+        if self._interpolator is not None:
+            self._interpolator.clear()
+        if self._output_filter is not None:
+            self._output_filter.reset()
+        self._latest_target_joint_pos = None
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -470,6 +530,126 @@ class VegaRobot:
         except Exception as exc:
             self._prev_command_successful = False
             raise CommunicationFailedError(str(exc)) from exc
+
+    # ------------------------------------------------------------------
+    # Interpolation-based API (input-rate / control-rate split)
+    # ------------------------------------------------------------------
+
+    def add_command_point(
+        self,
+        command: np.ndarray,
+        action_space: str,
+        gripper_action_space: str = "position",
+    ) -> None:
+        """Buffer a command at input rate for later interpolation.
+
+        Called by the gRPC Step() handler at input rate.  The actual
+        motor command is dispatched by the control-loop thread calling
+        ``execute_interpolated_tick()``.
+
+        When interpolation is disabled this falls back to the
+        synchronous ``update_command()`` path.
+        """
+        if self._interpolator is None:
+            # No interpolation — direct execution (legacy path).
+            self.update_command(command, action_space, gripper_action_space, blocking=False)
+            return
+
+        # Resolve action → joint-space target (same logic as update_command).
+        action = np.asarray(command, dtype=np.float64).reshape(-1)
+        dt = 1.0 / max(1, self.control_hz)
+        state_dict, _ = self.get_robot_state()
+        current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
+
+        if action_space.startswith("joint"):
+            if action.shape[0] != 8:
+                raise ValueError(f"{action_space} expects 8 values, got {action.shape[0]}")
+            arm_action = action[:7]
+            gripper_action = float(action[7])
+        else:
+            if action.shape[0] != 7:
+                raise ValueError(f"{action_space} expects 7 values, got {action.shape[0]}")
+            arm_action = action[:6]
+            gripper_action = float(action[6])
+
+        if action_space == "joint_position":
+            target_joint_pos = arm_action
+        elif action_space == "joint_velocity":
+            target_joint_pos = current_joint_pos + arm_action * dt
+        elif action_space == "joint_delta":
+            target_joint_pos = current_joint_pos + arm_action
+        elif action_space == "cartesian_velocity":
+            target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+        else:  # cartesian_delta
+            target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
+
+        timestamp = _time.perf_counter()
+        with self._interp_lock:
+            self._interpolator.add_point(timestamp, target_joint_pos)
+            self._latest_target_joint_pos = target_joint_pos.copy()
+            self._latest_gripper_action = gripper_action
+            self._latest_gripper_action_space = gripper_action_space
+
+    def execute_interpolated_tick(self) -> bool:
+        """Run one control-loop tick using interpolated position.
+
+        Called at control rate (e.g. 100 Hz) by the background control
+        thread.  Returns ``True`` if a command was sent, ``False`` if
+        there is no data yet.
+        """
+        with self._interp_lock:
+            if self._latest_target_joint_pos is None:
+                return False
+
+            now = _time.perf_counter()
+            pos, vel = self._interpolator.interpolate(now, compute_velocity=self.use_velocity_feedforward)
+
+            if pos is None:
+                # Not enough data for interpolation — use latest raw target.
+                pos = self._latest_target_joint_pos.copy()
+                vel = None
+
+            gripper_action = self._latest_gripper_action
+            gripper_vel = self._latest_gripper_action_space == "velocity"
+
+        # Apply the output filter (Butterworth / EMA) after interpolation.
+        if self._output_filter is not None:
+            pos = self._output_filter.apply(pos)
+
+        # Apply existing EMA 2nd-order smoothing on top if enabled.
+        if self._ema_alpha > 0.0:
+            dt = 1.0 / max(1, self.control_hz)
+            if self._filter_pos is None:
+                self._filter_pos = pos.copy()
+                self._filter_vel = np.zeros_like(pos)
+            else:
+                alpha = self._ema_alpha
+                omega = alpha / (dt * (1.0 - alpha))
+                exp_term = np.exp(-omega * dt)
+                err = self._filter_pos - pos
+                c = self._filter_vel + omega * err
+                self._filter_pos = pos + (err + c * dt) * exp_term
+                self._filter_vel = (self._filter_vel - c * omega * dt) * exp_term
+                pos = self._filter_pos.copy()
+
+        try:
+            self.update_joints(pos, velocity=False, blocking=False)
+            self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
+            self._prev_command_successful = True
+        except (JointLimitExceededError, IKFailedError):
+            self._prev_command_successful = False
+        except Exception as exc:
+            self._prev_command_successful = False
+            _logger.error("Interpolated tick failed: %s", exc)
+
+        return True
+
+    @property
+    def interpolation_enabled(self) -> bool:
+        """True when trajectory interpolation is active."""
+        return self._interpolator is not None
+
+    # ------------------------------------------------------------------
 
     # Per-joint maximum delta per control step (radians).
     # j1-j3 (shoulder/base) are kept conservative; j4-j7 (elbow/wrist)
