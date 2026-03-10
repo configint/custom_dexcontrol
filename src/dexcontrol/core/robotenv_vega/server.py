@@ -1142,7 +1142,7 @@ def main() -> None:
         "--vel-damp-thresh",
         type=float,
         default=0.05,
-        help="Velocity damping threshold in rad. Velocity tapers to 0 within this distance (default: 0.05). Use large value like 999 to disable.",
+        help="Velocity damping threshold in rad. Velocity tapers linearly from 0→100%% over this distance to target (default: 0.05). Smaller=less damping, larger=more damping.",
     )
     args = parser.parse_args()
 
