@@ -90,6 +90,7 @@ class VegaRobot:
         hw_correction_alpha: float = 0.7,
         max_delta_scale: float = 1.0,
         max_jerk: float = 0.25,
+        vel_ratio: float = 1.0,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -163,6 +164,7 @@ class VegaRobot:
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._vel_ratio = float(max(0.0, vel_ratio))
 
         # Critically damped 2nd-order smoothing filter for joint commands.
         # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
@@ -831,7 +833,7 @@ class VegaRobot:
             pos_err = np.abs(target_joint_pos - current)
             damp_thresh = 0.05  # rad – below this, velocity starts tapering
             damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
-            target_joint_vel = target_joint_vel * damp_scale
+            target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
             self._prev_joint_vel = target_joint_vel.copy()
             self.arm.set_joint_pos_vel(target_joint_pos, target_joint_vel, relative=False)
         elif blocking:

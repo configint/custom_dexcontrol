@@ -92,6 +92,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         max_delta_scale: float = 1.0,
         max_jerk: float = 0.25,
         rot_sensitivity: float = 1.0,
+        vel_ratio: float = 1.0,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -131,6 +132,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             hw_correction_alpha=hw_correction_alpha,
             max_delta_scale=max_delta_scale,
             max_jerk=max_jerk,
+            vel_ratio=vel_ratio,
         )
         self._robot.launch_robot()
 
@@ -873,6 +875,7 @@ def serve(
     max_delta_scale: float = 1.0,
     max_jerk: float = 0.25,
     rot_sensitivity: float = 1.0,
+    vel_ratio: float = 1.0,
     **kwargs,
 ) -> None:
     """Start Vega RobotEnv gRPC server."""
@@ -915,6 +918,7 @@ def serve(
         max_delta_scale=max_delta_scale,
         max_jerk=max_jerk,
         rot_sensitivity=rot_sensitivity,
+        vel_ratio=vel_ratio,
     )
 
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
@@ -1124,6 +1128,12 @@ def main() -> None:
         default=1.0,
         help="RPY rotation sensitivity multiplier (>1=more sensitive, default: 1.0)",
     )
+    parser.add_argument(
+        "--vel-ratio",
+        type=float,
+        default=1.0,
+        help="Velocity feedforward ratio (0.5=half speed, 1.0=full, default: 1.0)",
+    )
     args = parser.parse_args()
 
     serve(
@@ -1154,6 +1164,7 @@ def main() -> None:
         max_delta_scale=args.max_delta_scale,
         max_jerk=args.max_jerk,
         rot_sensitivity=args.rot_sensitivity,
+        vel_ratio=args.vel_ratio,
     )
 
 
