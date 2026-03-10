@@ -645,7 +645,7 @@ class VegaRobot:
                 pos = self._filter_pos.copy()
 
         try:
-            self.update_joints(pos, velocity=False, blocking=False)
+            self.update_joints(pos, velocity=False, blocking=False, feedforward_vel=vel)
             self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
@@ -688,6 +688,7 @@ class VegaRobot:
         joint_pos_command: np.ndarray,
         velocity: bool = False,
         blocking: bool = False,
+        feedforward_vel: np.ndarray | None = None,
     ) -> None:
         run_id = f"joint-diagnostics-{self.arm_side}"
         target_joint_pos = np.asarray(joint_pos_command, dtype=np.float64)
@@ -825,13 +826,18 @@ class VegaRobot:
         # #endregion
 
         if self.use_velocity_feedforward and not blocking:
-            dt = 1.0 / max(1, self.control_hz)
-            raw_vel = (target_joint_pos - current) / dt
-            if self._prev_joint_vel is not None:
-                a = self._vel_smoothing_alpha
-                target_joint_vel = a * raw_vel + (1.0 - a) * self._prev_joint_vel
+            if feedforward_vel is not None:
+                # Use trajectory-consistent velocity from interpolator directly.
+                target_joint_vel = np.asarray(feedforward_vel, dtype=np.float64)
             else:
-                target_joint_vel = raw_vel
+                # Fallback: estimate velocity from position error (legacy path).
+                dt = 1.0 / max(1, self.control_hz)
+                raw_vel = (target_joint_pos - current) / dt
+                if self._prev_joint_vel is not None:
+                    a = self._vel_smoothing_alpha
+                    target_joint_vel = a * raw_vel + (1.0 - a) * self._prev_joint_vel
+                else:
+                    target_joint_vel = raw_vel
             # Per-joint velocity damping: scale down velocity when delta is small
             # to help joints settle near target without overshoot.
             pos_err = np.abs(target_joint_pos - current)
