@@ -100,21 +100,21 @@ class RobotiqGripper:
         """
         pos_m = float(np.asarray(joint_pos, dtype=np.float64).flat[0])
         pos_m = float(np.clip(pos_m, 0.0, _STROKE_M))
-        self._gripper.goto(pos=pos_m, vel=0.05, force=50)
+        self._gripper.goto(pos=pos_m, vel=0.05, force=95)
         self._gripper.sendCommand()
         if wait_time > 0.0:
             time.sleep(wait_time)
 
     def open_hand(self, wait_time: float = 0.0, **_kwargs) -> None:
         """Open the gripper fully."""
-        self._gripper.goto(pos=_STROKE_M, vel=0.05, force=50)
+        self._gripper.goto(pos=_STROKE_M, vel=0.05, force=95)
         self._gripper.sendCommand()
         if wait_time > 0.0:
             time.sleep(wait_time)
 
     def close_hand(self, wait_time: float = 0.0, **_kwargs) -> None:
         """Close the gripper fully."""
-        self._gripper.goto(pos=0.0, vel=0.05, force=50)
+        self._gripper.goto(pos=0.0, vel=0.05, force=95)
         self._gripper.sendCommand()
         if wait_time > 0.0:
             time.sleep(wait_time)
