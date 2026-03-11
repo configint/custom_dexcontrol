@@ -168,6 +168,16 @@ class VegaRobot:
         self._vel_ratio = float(max(0.0, vel_ratio))
         self._vel_damp_thresh = float(max(0.001, vel_damp_thresh))
 
+        # Velocity logging for diagnostics.
+        vel_log_path = os.environ.get("VEL_LOG_PATH")
+        if vel_log_path:
+            self._vel_log_file = open(vel_log_path, "a")
+            header = f"timestamp,{','.join(f'j{i+1}_vel' for i in range(7))}\n"
+            self._vel_log_file.write(header)
+            _logger.info("Velocity logging enabled: %s", vel_log_path)
+        else:
+            self._vel_log_file = None
+
         # Critically damped 2nd-order smoothing filter for joint commands.
         # alpha controls responsiveness (0.0 = disabled, 0.3~0.8 = typical).
         self._ema_alpha = float(np.clip(ema_alpha, 0.0, 0.99))
@@ -839,6 +849,10 @@ class VegaRobot:
             damp_scale = np.clip(pos_err / damp_thresh, 0.0, 1.0)
             target_joint_vel = target_joint_vel * damp_scale * self._vel_ratio
             self._prev_joint_vel = target_joint_vel.copy()
+            if self._vel_log_file is not None:
+                self._vel_log_file.write(
+                    f"{_time.time()},{','.join(f'{v:.6f}' for v in target_joint_vel)}\n"
+                )
             self.arm.set_joint_pos_vel(target_joint_pos, target_joint_vel, relative=False)
         elif blocking:
             wait_time = 1.0 / max(1, self.control_hz)
@@ -1199,6 +1213,9 @@ class VegaRobot:
             pass
 
     def close(self) -> None:
+        if self._vel_log_file is not None:
+            self._vel_log_file.close()
+            self._vel_log_file = None
         self._stop_gripper_worker()
         if self.gripper_type == "robotiq" and self.hand is not None:
             try:
