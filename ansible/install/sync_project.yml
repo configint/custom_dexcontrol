@@ -8,6 +8,16 @@
     dexmate_pass: "{{ dexmate_pass | default('hello-dex') }}"
 
   tasks:
+    - name: Save current git branch and tag to version_info.txt
+      shell: |
+        echo "branch: $(git rev-parse --abbrev-ref HEAD)" >| version_info.txt
+        echo "commit: $(git rev-parse HEAD)" >> version_info.txt
+        echo "tag: $(git describe --tags --exact-match 2>/dev/null || echo 'no tag')" >> version_info.txt
+      args:
+        chdir: "{{ ((playbook_dir + '/../..') | realpath) }}"
+      delegate_to: localhost
+      become: false
+
     # ── Sync to teleop host (ds-teleop-0004-XX) ──────────────────────────────
     - name: Ensure local project directory exists on teleop host
       file:

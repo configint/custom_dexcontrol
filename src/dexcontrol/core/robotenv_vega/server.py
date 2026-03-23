@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -604,10 +605,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         del request, context
         try:
             self._robot.get_robot_state()
+            version_info = self._load_version_info()
+            version_str = version_info.get("tag", "1.0.0-vega")
             return robotenv_pb2.HealthCheckResponse(
                 status="HEALTHY",
                 message=f"Vega {self.arm_side} arm operational",
-                version="1.0.0-vega",
+                version=version_str,
             )
         except Exception as exc:
             return robotenv_pb2.HealthCheckResponse(
@@ -615,6 +618,34 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 message=str(exc),
                 version="1.0.0-vega",
             )
+
+    def GetVersion(self, request, context):
+        """Return deployed code version info."""
+        del request, context
+        info = self._load_version_info()
+        return robotenv_pb2.VersionInfo(
+            branch=info.get("branch", "unknown"),
+            commit=info.get("commit", "unknown"),
+            tag=info.get("tag", "unknown"),
+        )
+
+    def _load_version_info(self) -> dict[str, str]:
+        """Load version info from version_info.txt."""
+        info = {"branch": "unknown", "commit": "unknown", "tag": "unknown"}
+        # server.py is at <repo>/src/dexcontrol/core/robotenv_vega/server.py
+        # version_info.txt is at <repo>/version_info.txt
+        version_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "..", "..", "version_info.txt",
+        )
+        if os.path.exists(version_file):
+            with open(version_file, "r", encoding="utf-8") as f:
+                for line in f.read().splitlines():
+                    if ": " in line:
+                        key, value = line.split(": ", 1)
+                        if key in info:
+                            info[key] = value
+        return info
 
     def _create_observation(self) -> tuple[dict[str, Any], int]:
         state_dict, timestamp_dict = self._robot.get_robot_state()
