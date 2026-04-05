@@ -52,7 +52,13 @@ SUPPORTED_ACTION_SPACES = (
     "joint_delta",
     "cartesian_velocity",
     "cartesian_delta",
+    "target_cartesian_delta",
 )
+
+# Gains applied by Oculus controller to raw deltas before emitting
+# cartesian_velocity.  Used to recover the original (gain-free) delta.
+_TELEOP_POS_ACTION_GAIN = 5.0
+_TELEOP_ROT_ACTION_GAIN = 2.0
 
 
 class JointLimitExceededError(RuntimeError):
@@ -1090,16 +1096,46 @@ class VegaRobot:
             joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         return self._forward_kinematics(joint_positions)
 
+    @staticmethod
+    def _velocity_to_motor_delta(
+        velocity: np.ndarray,
+        max_lin_delta: float,
+        max_rot_delta: float,
+    ) -> np.ndarray:
+        """Replicate server ``_cartesian_velocity_to_delta`` logic.
+
+        Normalizes linear/rotation components independently (if norm > 1)
+        then scales by the per-step delta limits.
+        """
+        lin_vel = velocity[:3].copy()
+        rot_vel = velocity[3:6].copy()
+        lin_norm = float(np.linalg.norm(lin_vel))
+        rot_norm = float(np.linalg.norm(rot_vel))
+        if lin_norm > 1.0:
+            lin_vel /= lin_norm
+        if rot_norm > 1.0:
+            rot_vel /= rot_norm
+        return np.concatenate([lin_vel * max_lin_delta, rot_vel * max_rot_delta])
+
     def create_action_dict(
         self,
         action: np.ndarray,
         action_space: str,
         gripper_action_space: Optional[str] = None,
         robot_state: Optional[dict] = None,
+        max_lin_delta: Optional[float] = None,
+        max_rot_delta: Optional[float] = None,
     ) -> dict:
         """Convert action to comprehensive action dict with all representations.
 
         Used by policy_runner for action logging and data collection.
+
+        Parameters
+        ----------
+        max_lin_delta, max_rot_delta:
+            Per-step Cartesian delta limits used by the server's
+            ``_cartesian_velocity_to_delta``.  When provided the dict's
+            ``delta_action`` will match the motor command exactly.
         """
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space: {action_space}")
@@ -1137,12 +1173,32 @@ class VegaRobot:
         current_joint_pos = np.asarray(robot_state["joint_positions"], dtype=np.float64)
         current_cart_pos = np.asarray(robot_state["cartesian_position"], dtype=np.float64)
 
-        if action_space.startswith("cartesian"):
+        if action_space.startswith("cartesian") or action_space == "target_cartesian_delta":
             cart_action = action[:6]
 
-            if velocity:
+            if action_space == "target_cartesian_delta":
+                # target_cartesian_delta → recover velocity by multiplying gains
+                cart_velocity = np.empty(6, dtype=np.float64)
+                cart_velocity[:3] = cart_action[:3] * _TELEOP_POS_ACTION_GAIN
+                cart_velocity[3:6] = cart_action[3:6] * _TELEOP_ROT_ACTION_GAIN
+                action_dict["cartesian_velocity"] = cart_velocity.tolist()
+                action_dict["target_cartesian_delta"] = np.concatenate(
+                    [cart_action, [gripper_position]]
+                ).tolist()
+                # Compute motor delta using the same logic as the server
+                if max_lin_delta is not None and max_rot_delta is not None:
+                    cartesian_delta = self._velocity_to_motor_delta(
+                        cart_velocity, max_lin_delta, max_rot_delta,
+                    )
+                else:
+                    cartesian_delta = cart_velocity * dt
+            elif velocity:
                 # cartesian_velocity
                 action_dict["cartesian_velocity"] = cart_action.tolist()
+                # NOTE: This uses vel*dt which differs from the server's
+                # _cartesian_velocity_to_delta (normalize + max_delta scaling).
+                # Known discrepancy — see bugfix branch for the corrected
+                # version.  Kept as-is here for inference compatibility.
                 cartesian_delta = cart_action * dt
             else:
                 # cartesian_delta
@@ -1151,6 +1207,18 @@ class VegaRobot:
                 action_dict["cartesian_velocity"] = cartesian_velocity.tolist()
 
             action_dict["delta_action"] = np.concatenate([cartesian_delta, [gripper_action]]).tolist()
+
+            # target_cartesian_delta (add for all cartesian input spaces)
+            if "target_cartesian_delta" not in action_dict:
+                vel_for_tcd = (
+                    cart_action if velocity
+                    else action_dict["cartesian_velocity"]
+                )
+                tcd = np.empty(7, dtype=np.float64)
+                tcd[:3] = np.asarray(vel_for_tcd[:3]) / _TELEOP_POS_ACTION_GAIN
+                tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / _TELEOP_ROT_ACTION_GAIN
+                tcd[6] = gripper_position
+                action_dict["target_cartesian_delta"] = tcd.tolist()
 
             # Compute target cartesian position (using simple pose addition)
             target_cart = current_cart_pos.copy()

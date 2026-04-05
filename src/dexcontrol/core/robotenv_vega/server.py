@@ -414,6 +414,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "joint_delta",
                 "cartesian_velocity",
                 "cartesian_delta",
+                "target_cartesian_delta",
             ],
             metadata={
                 "robot_model": self.robot_model,
@@ -498,7 +499,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # -- end gripper debug --
 
             t_step_start = time.time()
-            if self.R_world_to_robot is not None and "cartesian" in action_space:
+            if self.R_world_to_robot is not None and (
+                "cartesian" in action_space or action_space == "target_cartesian_delta"
+            ):
                 action = self._transform_action_to_robot_frame(action)
             if action_space == "cartesian_velocity":
                 raw_action = action.copy()
@@ -510,6 +513,17 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     "Converted cartesian_velocity -> cartesian_delta: lin_norm=%.4f rot_norm=%.4f max_lin_delta=%.6f max_rot_delta=%.6f",
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
+            elif action_space == "target_cartesian_delta":
+                # Recover cartesian_velocity by re-applying teleop gains,
+                # then convert to motor delta via the standard path.
+                from dexcontrol.core.vega.robot import (
+                    _TELEOP_POS_ACTION_GAIN,
+                    _TELEOP_ROT_ACTION_GAIN,
+                )
+                action[:3] *= _TELEOP_POS_ACTION_GAIN
+                action[3:6] *= _TELEOP_ROT_ACTION_GAIN
+                action = self._cartesian_velocity_to_delta(action)
+                action_space_for_robot = "cartesian_delta"
             t_after_xform = time.time()
 
             # Get robot_state BEFORE executing action (needed for create_action_dict)
@@ -541,6 +555,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action_space=action_space,
                     gripper_action_space=gripper_action_space,
                     robot_state=pre_action_state,
+                    max_lin_delta=self._max_lin_delta,
+                    max_rot_delta=self._max_rot_delta,
                 )
                 action_info = self._action_dict_to_proto(action_dict)
             except Exception as exc:
