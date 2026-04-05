@@ -541,6 +541,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     action_space=action_space,
                     gripper_action_space=gripper_action_space,
                     robot_state=pre_action_state,
+                    max_lin_delta=self._max_lin_delta,
+                    max_rot_delta=self._max_rot_delta,
                 )
                 action_info = self._action_dict_to_proto(action_dict)
             except Exception as exc:

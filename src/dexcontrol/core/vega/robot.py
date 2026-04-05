@@ -1090,16 +1090,46 @@ class VegaRobot:
             joint_positions = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         return self._forward_kinematics(joint_positions)
 
+    @staticmethod
+    def _velocity_to_motor_delta(
+        velocity: np.ndarray,
+        max_lin_delta: float,
+        max_rot_delta: float,
+    ) -> np.ndarray:
+        """Replicate server ``_cartesian_velocity_to_delta`` logic.
+
+        Normalizes linear/rotation components independently (if norm > 1)
+        then scales by the per-step delta limits.
+        """
+        lin_vel = velocity[:3].copy()
+        rot_vel = velocity[3:6].copy()
+        lin_norm = float(np.linalg.norm(lin_vel))
+        rot_norm = float(np.linalg.norm(rot_vel))
+        if lin_norm > 1.0:
+            lin_vel /= lin_norm
+        if rot_norm > 1.0:
+            rot_vel /= rot_norm
+        return np.concatenate([lin_vel * max_lin_delta, rot_vel * max_rot_delta])
+
     def create_action_dict(
         self,
         action: np.ndarray,
         action_space: str,
         gripper_action_space: Optional[str] = None,
         robot_state: Optional[dict] = None,
+        max_lin_delta: Optional[float] = None,
+        max_rot_delta: Optional[float] = None,
     ) -> dict:
         """Convert action to comprehensive action dict with all representations.
 
         Used by policy_runner for action logging and data collection.
+
+        Parameters
+        ----------
+        max_lin_delta, max_rot_delta:
+            Per-step Cartesian delta limits used by the server's
+            ``_cartesian_velocity_to_delta``.  When provided the dict's
+            ``delta_action`` will match the motor command exactly.
         """
         if action_space not in SUPPORTED_ACTION_SPACES:
             raise ValueError(f"Unsupported action_space: {action_space}")
@@ -1143,7 +1173,15 @@ class VegaRobot:
             if velocity:
                 # cartesian_velocity
                 action_dict["cartesian_velocity"] = cart_action.tolist()
-                cartesian_delta = cart_action * dt
+                # Use server-consistent delta when limits are available;
+                # previous code used ``cart_action * dt`` which diverges from
+                # the actual motor delta computed by the server.
+                if max_lin_delta is not None and max_rot_delta is not None:
+                    cartesian_delta = self._velocity_to_motor_delta(
+                        cart_action, max_lin_delta, max_rot_delta,
+                    )
+                else:
+                    cartesian_delta = cart_action * dt  # legacy fallback
             else:
                 # cartesian_delta
                 cartesian_delta = cart_action
