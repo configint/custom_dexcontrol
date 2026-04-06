@@ -3,9 +3,9 @@
   hosts: all
   become: yes
   vars:
-    dexmate_ip: "{{ dexmate_ip | default('192.168.5.20') }}"
-    dexmate_user: "{{ dexmate_user | default('dexmate') }}"
-    dexmate_pass: "{{ dexmate_pass | default('hello-dex') }}"
+    dexmate_ip: "192.168.5.20"
+    dexmate_user: "dexmate"
+    dexmate_pass: "hello-dex"
 
   tasks:
     # ── Teleop host setup (ds-teleop-0004-XX) ────────────────────────────────
