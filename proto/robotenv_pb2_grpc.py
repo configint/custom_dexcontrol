@@ -2,7 +2,7 @@
 """Client and server classes corresponding to protobuf-defined services."""
 import grpc
 
-import robotenv_pb2 as robotenv__pb2
+from proto import robotenv_pb2 as robotenv__pb2
 
 
 class RobotEnvStub(object):
