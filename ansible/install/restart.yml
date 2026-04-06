@@ -88,11 +88,7 @@
       become: false
 
     # ── Health checks ────────────────────────────────────────────────────────
-    - name: Wait 20 seconds for servers to initialize
-      wait_for:
-        timeout: 20
-
-    - name: Health check — left arm server (port 50061)
+    - name: Wait for left arm server (port 50061)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
           'nc -z {{ dexmate_ip }} 50061'
@@ -100,8 +96,11 @@
         executable: /bin/bash
       register: health_left
       become: false
+      retries: 12
+      delay: 5
+      until: health_left.rc == 0
 
-    - name: Health check — right arm server (port 50063)
+    - name: Wait for right arm server (port 50063)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
           'nc -z {{ dexmate_ip }} 50063'
@@ -109,16 +108,9 @@
         executable: /bin/bash
       register: health_right
       become: false
-
-    - name: Fail if left arm server is not listening
-      fail:
-        msg: "Left arm gRPC server (port 50061) is not listening after 20s"
-      when: health_left.rc != 0
-
-    - name: Fail if right arm server is not listening
-      fail:
-        msg: "Right arm gRPC server (port 50063) is not listening after 20s"
-      when: health_right.rc != 0
+      retries: 12
+      delay: 5
+      until: health_right.rc == 0
 
     - name: Display success
       debug:
