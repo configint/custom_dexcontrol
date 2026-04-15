@@ -55,13 +55,9 @@ _INIT_JOINTS = {
     "left":  np.array([-1.4234,  1.3524,  2.8707, -1.981,   0.6751, -0.1662,  0.068]),
     "right": np.array([ 1.4234, -1.3524, -2.8707, -1.981,  -0.1515,  0.1662, -0.068]),
 }
-_1ST_RESET_MIDDLE_JOINTS = {
-    "left": np.array([-1.5803, 1.4984, 2.8335, -1.7935, 0.1061, -0.8334, 0.3066]),
-    "right": np.array([1.5803, -1.4984, -2.8335, -1.7935, -0.1061, 0.8334, -0.3066])
-}
-_2ND_RESET_MIDDLE_JOINTS = {
-    "left":  np.array([-2.218,   0.743,   2.8684, -0.5, -1.5, -0.6128, -1.1779]),
-    "right": np.array([ 2.218,  -0.743,  -2.8684, -0.5,  1.5,  0.6128,  1.1779]),
+_RESET_MIDDLE_JOINTS = {
+    "left":  np.array([-2.7592,   1.3579,   2.8643, -1.8855, 0.6702, -0.1592, 0.2338]),
+    "right": np.array([ 2.7592,   -1.3579,   -2.8643, -1.8855, -0.6702, 0.1592, -0.2338]),
 }
 
 
@@ -713,16 +709,10 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info("Reset[%s]: gripper done (%.2fs), starting reset motion", self.arm_side, time.time() - t0)
         self._robot.reset_filter_state()
 
-        # Move to middle waypoint first to avoid collisions.
-        middle1_f64 = np.asarray(self.reset_1st_middle_joints, dtype=np.float64)
+        # Move to middle waypoint to avoid collisions.
+        middle_f64 = np.asarray(self.reset_2nd_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle1_f64)
-        LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
-        
-        # Move to middle waypoint second to avoid collisions.
-        middle2_f64 = np.asarray(self.reset_2nd_middle_joints, dtype=np.float64)
-        LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
-        self._move_incremental(middle2_f64)
+        self._move_incremental(middle_f64)
         LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
 
         # Then move to the final target (home/init position).
