@@ -774,15 +774,22 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
             new_actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
             max_move = float(np.max(np.abs(new_actual - actual)))
-            if max_move < 0.001:
+            if max_move < 0.005:
                 if settle_start is None:
                     settle_start = time.time()
                 elif time.time() - settle_start > self._RESET_SETTLE_S:
-                    LOGGER.info(
-                        "Arm settled with max error %.4f rad (tolerance %.4f)",
-                        max_err, tol,
-                    )
-                    break
+                    if max_err < settle_tol:
+                        LOGGER.info(
+                            "Arm settled with max error %.4f rad (settle_tol %.4f)",
+                            max_err, settle_tol,
+                        )
+                        break
+                    else:
+                        LOGGER.debug(
+                            "Arm stopped but error %.4f > settle_tol %.4f, continuing",
+                            max_err, settle_tol,
+                        )
+                        settle_start = None
             else:
                 settle_start = None
 
