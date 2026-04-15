@@ -156,8 +156,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         # Override home position with per-arm init joints.
         self.reset_joints = _INIT_JOINTS[arm_side].copy()
-        self.reset_1st_middle_joints = _1ST_RESET_MIDDLE_JOINTS[arm_side].copy()
-        self.reset_2nd_middle_joints = _2ND_RESET_MIDDLE_JOINTS[arm_side].copy()
+        self.reset_middle_joints = _RESET_MIDDLE_JOINTS[arm_side].copy()
         self.safe_transit_pose = self._robot.safe_transit_pose.copy()
 
         if base_frame_rotation is not None:
@@ -698,8 +697,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
     _RESET_TOLERANCE_RAD = 0.05
     _RESET_TIMEOUT_S = 30.0
-    _RESET_CMD_HZ = 200.0
-    _RESET_MAX_STEP_RAD = 0.125
+    _RESET_CMD_HZ = 100.0
+    _RESET_MAX_STEP_RAD = 0.2
     _RESET_SETTLE_S = 0.5
 
     def _execute_reset_sequence(self, target_joints: np.ndarray) -> None:
@@ -710,7 +709,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._robot.reset_filter_state()
 
         # Move to middle waypoint to avoid collisions.
-        middle_f64 = np.asarray(self.reset_2nd_middle_joints, dtype=np.float64)
+        middle_f64 = np.asarray(self.reset_middle_joints, dtype=np.float64)
         LOGGER.info("Reset[%s]: moving to middle waypoint", self.arm_side)
         self._move_incremental(middle_f64)
         LOGGER.info("Reset[%s]: middle waypoint reached (%.2fs)", self.arm_side, time.time() - t0)
@@ -744,7 +743,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         max_step = self._RESET_MAX_STEP_RAD
         deadline = time.time() + t_max
         settle_start = None
-        no_progress_start = None
+        prev_actual = None
 
         while time.time() < deadline:
             if self._cancel_move.is_set():
@@ -760,43 +759,24 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             clipped = np.clip(diff, -max_step, max_step)
             intermediate = actual + clipped
             self._robot.arm._send_position_command(intermediate)
-            time.sleep(dt)
 
-            new_actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
-            max_move = float(np.max(np.abs(new_actual - actual)))
-            if max_move < 0.005:
-                if settle_start is None:
-                    settle_start = time.time()
-                elif time.time() - settle_start > self._RESET_SETTLE_S:
-                    if max_err < settle_tol:
+            # Settle detection using previous loop's reading (no extra read).
+            if prev_actual is not None:
+                max_move = float(np.max(np.abs(actual - prev_actual)))
+                if max_move < 0.005 and max_err < settle_tol:
+                    if settle_start is None:
+                        settle_start = time.time()
+                    elif time.time() - settle_start > self._RESET_SETTLE_S:
                         LOGGER.info(
                             "Arm settled with max error %.4f rad (settle_tol %.4f)",
                             max_err, settle_tol,
                         )
                         break
-                    else:
-                        LOGGER.debug(
-                            "Arm stopped but error %.4f > settle_tol %.4f, continuing",
-                            max_err, settle_tol,
-                        )
-                        settle_start = None
-            else:
-                settle_start = None
+                else:
+                    settle_start = None
 
-            # Detect near-target oscillation: close enough but motor jitter
-            # prevents both tight tolerance and settle from triggering.
-            if max_err < settle_tol:
-                if no_progress_start is None:
-                    no_progress_start = time.time()
-                elif time.time() - no_progress_start > 2.0:
-                    LOGGER.info(
-                        "Arm within settle tolerance (max_err=%.4f < %.4f) "
-                        "for 2s, accepting. (tight tol=%.4f)",
-                        max_err, settle_tol, tol,
-                    )
-                    break
-            else:
-                no_progress_start = None
+            prev_actual = actual
+            time.sleep(dt)
         else:
             actual = np.asarray(self._robot.arm.get_joint_pos(), dtype=np.float64)
             max_err = float(np.max(np.abs(target - actual)))
