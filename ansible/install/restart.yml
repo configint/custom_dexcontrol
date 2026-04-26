@@ -6,6 +6,9 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
+    # Gripper selection: "robotiq" (default, ttyUSB) or "sr_gripper" (EtherCAT).
+    # Override with `-e gripper_type=sr_gripper` on the ansible-playbook CLI.
+    gripper_type: "robotiq"
 
   tasks:
     # ── Pre-flight checks ────────────────────────────────────────────────────
@@ -29,28 +32,76 @@
         msg: "Cannot reach {{ dexmate_ip }} — dexmate machine is offline or not connected"
       when: dexmate_ping.rc != 0
 
-    # ── Detect ttyUSB devices ────────────────────────────────────────────────
-    - name: Check /dev/ttyUSB* devices on dexmate
+    # ── Detect Robotiq ttyUSB devices ────────────────────────────────────────
+    - name: Check /dev/ttyUSB* devices on dexmate (Robotiq)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} 'ls /dev/ttyUSB*'
       args:
         executable: /bin/bash
       register: ttyusb_list
       become: false
+      when: gripper_type == "robotiq"
 
-    - name: Fail if fewer than 2 ttyUSB devices found
+    - name: Fail if fewer than 2 ttyUSB devices found (Robotiq)
       fail:
         msg: "Expected 2 /dev/ttyUSB* devices, found: {{ ttyusb_list.stdout_lines }}"
-      when: ttyusb_list.stdout_lines | length < 2
+      when: gripper_type == "robotiq" and ttyusb_list.stdout_lines | length < 2
 
-    - name: Resolve left/right gripper comports
+    - name: Resolve left/right Robotiq comports
       set_fact:
         left_gripper_port: "{{ ttyusb_list.stdout_lines | sort | first }}"
         right_gripper_port: "{{ ttyusb_list.stdout_lines | sort | last }}"
+      when: gripper_type == "robotiq"
+
+    # ── Detect SR EtherCAT ifaces ───────────────────────────────────────────
+    # Probe every non-skipped NIC on dexmate, pick the ones whose first slave
+    # is an SR DCU (vendor=0x534543, product=0x1002), then sort the names.
+    # First name -> left arm, last -> right arm. Same convention as the
+    # Robotiq /dev/ttyUSB* sort above so left/right assignment is stable.
+    - name: Probe EtherCAT NICs on dexmate for SR DCU
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'python - <<PY
+        import pysoem
+        SKIP = ("lo", "wl", "tailscale", "docker", "veth", "br-")
+        SR_VENDOR, SR_PRODUCT = 0x534543, 0x1002
+        found = []
+        for a in pysoem.find_adapters():
+            if a.name.startswith(SKIP):
+                continue
+            m = pysoem.Master()
+            try:
+                m.open(a.name)
+                if m.config_init() > 0 and m.slaves[0].man == SR_VENDOR and m.slaves[0].id == SR_PRODUCT:
+                    found.append(a.name)
+            except Exception:
+                pass
+            finally:
+                try: m.close()
+                except: pass
+        for name in sorted(found):
+            print(name)
+        PY'
+      args:
+        executable: /bin/bash
+      register: sr_iface_list
+      become: false
+      when: gripper_type == "sr_gripper"
+
+    - name: Fail if fewer than 2 SR DCU ifaces found
+      fail:
+        msg: "Expected 2 SR DCU EtherCAT ifaces, found: {{ sr_iface_list.stdout_lines }}"
+      when: gripper_type == "sr_gripper" and sr_iface_list.stdout_lines | length < 2
+
+    - name: Resolve left/right SR EtherCAT ifaces
+      set_fact:
+        left_gripper_port: "{{ sr_iface_list.stdout_lines | first }}"
+        right_gripper_port: "{{ sr_iface_list.stdout_lines | last }}"
+      when: gripper_type == "sr_gripper"
 
     - name: Display gripper port assignments
       debug:
-        msg: "Left gripper: {{ left_gripper_port }} / Right gripper: {{ right_gripper_port }}"
+        msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
 
     # ── Kill existing sessions ───────────────────────────────────────────────
     - name: Kill existing robot-server tmux session on dexmate
@@ -62,6 +113,13 @@
       become: false
 
     # ── Start robot gRPC servers ─────────────────────────────────────────────
+    # The gripper-port flag differs between gripper types:
+    #   robotiq      -> --robotiq-comport <ttyUSB>
+    #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
+    - name: Resolve gripper-port CLI flag
+      set_fact:
+        gripper_port_flag: "{{ '--gripper-iface' if gripper_type == 'sr_gripper' else '--robotiq-comport' }}"
+
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
@@ -69,8 +127,8 @@
         tmux send-keys -t robot-server "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side left \
             --grpc-port 50061 \
-            --gripper-type robotiq \
-            --robotiq-comport {{ left_gripper_port }} \
+            --gripper-type {{ gripper_type }} \
+            {{ gripper_port_flag }} {{ left_gripper_port }} \
             --use-velocity-feedforward \
             --ema-alpha 0.7" C-m
         sleep 0.5
@@ -78,8 +136,8 @@
         tmux send-keys -t robot-server.1 "python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
             --arm-side right \
             --grpc-port 50063 \
-            --gripper-type robotiq \
-            --robotiq-comport {{ right_gripper_port }} \
+            --gripper-type {{ gripper_type }} \
+            {{ gripper_port_flag }} {{ right_gripper_port }} \
             --use-velocity-feedforward \
             --ema-alpha 0.7" C-m
         ENDSSH

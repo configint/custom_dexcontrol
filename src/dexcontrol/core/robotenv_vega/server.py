@@ -1053,7 +1053,15 @@ def main() -> None:
         "--robotiq-comport",
         type=str,
         default="/dev/ttyUSB0",
-        help="Serial port for Robotiq gripper when --gripper-type=robotiq (default: /dev/ttyUSB0)",
+        help="Serial port for Robotiq gripper when --gripper-type=robotiq (default: /dev/ttyUSB0). "
+             "For SR gripper, prefer --gripper-iface; this flag is still accepted as a fallback.",
+    )
+    parser.add_argument(
+        "--gripper-iface",
+        type=str,
+        default=None,
+        help="EtherCAT network interface for SR gripper (e.g. enx00e04c680093). "
+             "Ignored for non-EtherCAT grippers.",
     )
     parser.add_argument(
         "--ema-alpha",
@@ -1181,6 +1189,11 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    # Both flags feed the same downstream "where is the gripper attached"
+    # slot. --gripper-iface is the canonical name for SR; --robotiq-comport
+    # is kept for backwards compatibility and as a generic fallback.
+    gripper_addr = args.gripper_iface or args.robotiq_comport
+
     serve(
         grpc_port=args.grpc_port,
         robot_model=args.robot_model,
@@ -1191,7 +1204,7 @@ def main() -> None:
         use_velocity_feedforward=args.use_velocity_feedforward,
         base_frame_rotation=args.base_frame_rotation,
         ik_solver_type=args.ik_solver,
-        robotiq_comport=args.robotiq_comport,
+        robotiq_comport=gripper_addr,
         ema_alpha=args.ema_alpha,
         ik_damping_default=args.ik_damping_default,
         ik_damping_torso=args.ik_damping_torso,
