@@ -41,6 +41,17 @@
         executable: /bin/bash
       become: false
 
+    - name: Install SR gripper dependencies on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        pip install pysoem
+        cd ~/custom_dexcontrol
+        pip install -e sr_gripper_controller/ 2>&1 | tail -5
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+
     - name: Ensure dexmate user is in dialout group (serial port access)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \

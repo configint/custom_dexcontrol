@@ -134,6 +134,9 @@ class VegaRobot:
         if gripper_type == "robotiq":
             from dexcontrol.core.robotiq_gripper import RobotiqGripper  # lazy import
             self.hand = RobotiqGripper(comport=self._robotiq_comport)
+        elif gripper_type == "sr_gripper":
+            from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
+            self.hand = SrGripperAdapter(comport=self._robotiq_comport)
         else:
             self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
 
@@ -1285,7 +1288,7 @@ class VegaRobot:
             self._vel_log_file.close()
             self._vel_log_file = None
         self._stop_gripper_worker()
-        if self.gripper_type == "robotiq" and self.hand is not None:
+        if self.gripper_type in ("robotiq", "sr_gripper") and self.hand is not None:
             try:
                 self.hand.shutdown()
             except Exception:
