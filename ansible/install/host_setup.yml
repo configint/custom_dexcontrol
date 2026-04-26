@@ -52,6 +52,23 @@
         executable: /bin/bash
       become: false
 
+    - name: Grant raw-socket capability to dexmate Python (EtherCAT)
+      # Lets the SR gripper open raw EtherCAT sockets without sudo at run
+      # time. The capability is bound to the python binary, so re-run this
+      # whenever the env's python is recreated. Resolves the symlink so
+      # setcap targets the real ELF binary.
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        PYBIN=$(python -c 'import os, sys; print(os.path.realpath(sys.executable))')
+        echo "$PYBIN"
+        sudo setcap cap_net_raw,cap_net_admin=eip "$PYBIN"
+        getcap "$PYBIN"
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+      ignore_errors: true
+
     - name: Ensure dexmate user is in dialout group (serial port access)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
