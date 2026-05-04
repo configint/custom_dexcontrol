@@ -63,7 +63,7 @@ class SrGripperAdapter:
     def __init__(
         self,
         comport: str = "eth0",
-        init_timeout: float = 15.0,
+        init_timeout: float = 20.0,
     ) -> None:
         """Connect to the gripper and run full initialisation.
 
