@@ -533,18 +533,25 @@ class VegaRobot:
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
 
-    def _hand_dof(self) -> int:
-        """End-effector DoF: N for a multi-finger hand, else 1 (scalar gripper).
+    # gripper_types that expose the end-effector as a multi-DoF joint vector.
+    # Everything else — INCLUDING gripper_type "default" with an integrated
+    # dexbot F5D6 hand attached — keeps the scalar [0,1] contract exactly as
+    # main: reclassifying the dexbot hand by its joint_name alone would change
+    # its observation schema and add crash paths for deployments that never
+    # opted in.
+    _MULTI_DOF_GRIPPER_TYPES = ("vega_hand", "wuji_hand", "wuji_hand_2")
 
-        Prefer the component's joint_name list (cached at init): it is the
-        reliable DoF for hand components (6 for F5D6, 20 for Wuji) and does NOT
-        depend on live hardware state — unlike get_joint_pos(), which may raise
-        until the first state arrives and would make this fall back to 1
-        mid-run, rejecting the multi-DoF hand action. Scalar grippers
-        (Robotiq/SR) have no joint_name, so fall back to get_joint_pos().size
-        for them.
+    def _hand_dof(self) -> int:
+        """End-effector DoF: N for an opted-in multi-finger hand, else 1.
+
+        Gated on gripper_type first (see _MULTI_DOF_GRIPPER_TYPES). For opted-in
+        hands, prefer the component's joint_name list (cached at init): it is
+        the reliable DoF (6 for F5D6, 20 for Wuji) and does NOT depend on live
+        hardware state — unlike get_joint_pos(), which may raise until the
+        first state arrives and would make this fall back to 1 mid-run,
+        rejecting the multi-DoF hand action.
         """
-        if self.hand is None:
+        if self.hand is None or self.gripper_type not in self._MULTI_DOF_GRIPPER_TYPES:
             return 1
         try:
             names = getattr(self.hand, "joint_name", None)
@@ -603,17 +610,31 @@ class VegaRobot:
         if self.hand is None:
             return
         target = np.asarray(hand_action, dtype=np.float64)
-        limits = getattr(self.hand, "joint_limits", None)
-        if limits is not None and np.asarray(limits).shape == (target.size, 2):
-            limits = np.asarray(limits, dtype=np.float64)
-            target = np.clip(target, limits[:, 0], limits[:, 1])
-        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
         try:
+            if gripper_action_space == "velocity":
+                # Integrate joint velocities (rad/s) into absolute targets —
+                # treating a velocity command as absolute radians would snap
+                # the hand toward the zero pose.
+                current = np.asarray(self.hand.get_joint_pos(), dtype=np.float64).reshape(-1)
+                if current.size != target.size:
+                    raise ValueError(
+                        f"hand velocity command size {target.size} != state size {current.size}"
+                    )
+                target = current + target * (1.0 / max(1, self.control_hz))
+            limits = getattr(self.hand, "joint_limits", None)
+            if limits is not None and np.asarray(limits).shape == (target.size, 2):
+                limits = np.asarray(limits, dtype=np.float64)
+                target = np.clip(target, limits[:, 0], limits[:, 1])
+            wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
             with self._gripper_io_lock:
                 self.hand.set_joint_pos(target, wait_time=wait_time)
             self._prev_gripper_command_successful = True
         except Exception:
             self._prev_gripper_command_successful = False
+            # Parity with the scalar path: blocking callers (Reset, blocking
+            # update_command) must see the failure, not just a status flag.
+            if blocking:
+                raise
 
     def update_command(
         self,
@@ -1033,18 +1054,21 @@ class VegaRobot:
             gripper_position = self.get_cached_gripper_position()
 
         # Tactile: preferred driver accessor (WujiHandAdapter.get_hand_tactile),
-        # with the legacy F5D6_V2 fingertip-force gate kept for the dexbot hand.
-        # Scalar grippers have neither method, so they stay completely
-        # untouched — the key is never added.
+        # with the legacy F5D6_V2 fingertip-force gate kept for the dexbot
+        # hand. Gated on the multi-DoF opt-in — a "default"-gripper deployment
+        # with an F5D6V2 attached must stay byte-identical to main (no new key,
+        # and no per-step get_finger_tip_force warnings when the touch sensor
+        # is unconfigured). Scalar grippers have neither method anyway.
         hand_tactile = None
-        if hasattr(self.hand, "get_hand_tactile"):
-            _force = self.hand.get_hand_tactile()
-            if _force is not None:
-                hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
-        elif hasattr(self.hand, "get_finger_tip_force"):
-            _force = self.hand.get_finger_tip_force()
-            if _force is not None:
-                hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
+        if self._hand_dof() > 1:
+            if hasattr(self.hand, "get_hand_tactile"):
+                _force = self.hand.get_hand_tactile()
+                if _force is not None:
+                    hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
+            elif hasattr(self.hand, "get_finger_tip_force"):
+                _force = self.hand.get_finger_tip_force()
+                if _force is not None:
+                    hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
 
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:

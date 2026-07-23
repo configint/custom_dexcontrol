@@ -167,39 +167,61 @@ class WujiHandAdapter:
         self._hand = self._connect(sn, init_timeout)
         self._is_hand2 = isinstance(self._hand, WujiHand2)
 
-        self._limits = self._resolve_limits(joint_limits)
-
-        # Locks & caches. _cached_pos is measured state only (worker-updated).
-        self._state_lock = threading.Lock()
-        self._cached_pos = np.zeros(_N_JOINTS, dtype=np.float64)
-        self._cached_tactile: np.ndarray | None = None
-        self._cached_tactile_raw: np.ndarray | None = None
-        self._last_state_time = 0.0
-
-        # Command channel (model-specific) + state/tactile subscriptions.
+        # Everything below can touch live hardware; a failure part-way must
+        # not leave motors enabled / channels open with no owner.
         self._publisher = None
         self._rt_ctx = None
         self._rt = None
-        self._configure_control(effort_limit, mit_kp, mit_kd,
-                                lowpass_cutoff_hz, init_timeout)
-        self._state_sub = self._hand.joint_states().subscribe()
+        self._state_sub = None
         self._tactile_subs: dict[str, object] = {}
         self._tactile_decoders: dict[str, object] = {}
         self._glove_frame_sub = None
-        if self._tactile_enabled:
-            self._setup_tactile()
+        try:
+            self._limits = self._resolve_limits(joint_limits)
 
-        # Worker thread (same drain-queue pattern as RobotiqGripper).
-        self._command_queue: Queue[np.ndarray] = Queue(maxsize=1)
-        self._latest_target: np.ndarray | None = None
-        self._stop_event = threading.Event()
-        self._connected = True
-        self._worker = threading.Thread(
-            target=self._worker_loop,
-            name=f"wuji-hand-{handedness}",
-            daemon=True,
-        )
-        self._worker.start()
+            # Locks & caches. _cached_pos is measured state only (worker-updated).
+            self._state_lock = threading.Lock()
+            self._cached_pos = np.zeros(_N_JOINTS, dtype=np.float64)
+            self._cached_tactile: np.ndarray | None = None
+            self._cached_tactile_raw: np.ndarray | None = None
+            # Anchor the watchdog at construction: if the hand NEVER produces a
+            # state frame, commands pause after the stale window instead of
+            # republishing to a never-alive link forever.
+            self._last_state_time = time.monotonic()
+            # Hand 2 joint ids: assumed 0-based; auto-detected from the first
+            # frame (a 1..20 range means 1-based) since the SDK contract is
+            # not documented. None until detected.
+            self._nid_offset: int | None = None
+
+            # Command channel (model-specific) + state/tactile subscriptions.
+            self._configure_control(effort_limit, mit_kp, mit_kd,
+                                    lowpass_cutoff_hz, init_timeout)
+            self._state_sub = self._hand.joint_states().subscribe()
+            if self._tactile_enabled:
+                self._setup_tactile()
+
+            # Worker thread (same drain-queue pattern as RobotiqGripper).
+            self._command_queue: Queue[np.ndarray] = Queue(maxsize=1)
+            self._latest_target: np.ndarray | None = None
+            self._stop_event = threading.Event()
+            self._connected = True
+            self._worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"wuji-hand-{handedness}",
+                daemon=True,
+            )
+            self._worker.start()
+        except Exception:
+            self._teardown_channels()
+            try:
+                self._hand.disable()
+            except Exception:
+                pass
+            try:
+                self._manager.disconnect_all()
+            except Exception:
+                pass
+            raise
 
         logger.info(
             "Wuji {} ({}) ready: sn={}, tactile={}, async worker started.",
@@ -282,7 +304,15 @@ class WujiHandAdapter:
         try:
             while time.monotonic() < deadline:
                 time.sleep(0.2)
-                frame = diag_sub.recv()
+                # Drain to the NEWEST diagnostics frame — recv() returns queued
+                # frames one at a time, and judging enable state off a stale
+                # frame can produce a spurious timeout.
+                frame = None
+                while True:
+                    f = diag_sub.recv()
+                    if f is None:
+                        break
+                    frame = f
                 if frame is None or not frame.joints:
                     continue
                 if all(e.status_word.ext_state == 2 for e in frame.joints):
@@ -406,13 +436,16 @@ class WujiHandAdapter:
         while not self._stop_event.is_set():
             t0 = time.monotonic()
 
-            # Drain queue — only keep the newest command.
+            # Drain queue — only keep the newest command. The drain loop always
+            # ends by raising Empty, so it must NOT clobber a target that was
+            # already dequeued (same pattern as RobotiqGripper._worker_loop).
+            target = None
             try:
                 target = self._command_queue.get(timeout=period)
                 while True:
                     target = self._command_queue.get_nowait()
             except Empty:
-                target = None
+                pass
             if target is not None:
                 self._latest_target = target
 
@@ -428,9 +461,10 @@ class WujiHandAdapter:
             self._refresh_state()
             self._refresh_tactile()
 
-            # Watchdog on the joint_states stream.
+            # Watchdog on the joint_states stream (anchored at construction, so
+            # it also fires when the hand never produces a single frame).
             stale = (time.monotonic() - self._last_state_time) > 1.0
-            if stale and self._connected and self._last_state_time > 0.0:
+            if stale and self._connected:
                 self._connected = False
                 logger.warning(
                     "Wuji hand ({}): joint_states silent >1s — link lost? "
@@ -464,11 +498,25 @@ class WujiHandAdapter:
                 return
             if self._is_hand2:
                 # Variable-length list of online joints; update per nid so a
-                # briefly offline joint keeps its last value.
+                # briefly offline joint keeps its last value. The nid base is
+                # undocumented — detect once from the first frame (M1 verifies
+                # on hardware).
+                if self._nid_offset is None and latest.joints:
+                    nids = [e.nid for e in latest.joints]
+                    if min(nids) >= 1 and max(nids) == _N_JOINTS:
+                        self._nid_offset = 1
+                        logger.warning(
+                            "Wuji Hand 2 ({}): joint nids look 1-based; "
+                            "applying -1 offset.", self._handedness,
+                        )
+                    else:
+                        self._nid_offset = 0
+                offset = self._nid_offset or 0
                 with self._state_lock:
                     for entry in latest.joints:
-                        if 0 <= entry.nid < _N_JOINTS:
-                            self._cached_pos[entry.nid] = entry.position
+                        idx = entry.nid - offset
+                        if 0 <= idx < _N_JOINTS:
+                            self._cached_pos[idx] = entry.position
             else:
                 pos = np.asarray(latest.position, dtype=np.float64)
                 if pos.size == _N_JOINTS:
@@ -643,34 +691,54 @@ class WujiHandAdapter:
 
     @property
     def serial_number(self) -> str:
-        return str(getattr(self._hand, "serial_number", "unknown"))
+        sn = getattr(self._hand, "serial_number", "unknown")
+        if callable(sn):
+            try:
+                sn = sn()
+            except Exception:
+                sn = "unknown"
+        return str(sn)
+
+    def _teardown_channels(self) -> None:
+        """Best-effort close of every subscription/command channel."""
+        for sub in self._tactile_subs.values():
+            try:
+                sub.close()
+            except Exception:
+                pass
+        self._tactile_subs.clear()
+        if self._glove_frame_sub is not None:
+            try:
+                self._glove_frame_sub.close()
+            except Exception:
+                pass
+            self._glove_frame_sub = None
+        if self._state_sub is not None:
+            try:
+                self._state_sub.close()
+            except Exception:
+                pass
+            self._state_sub = None
+        try:
+            if self._publisher is not None:
+                self._publisher.close()
+        except Exception:
+            pass
+        self._publisher = None
+        try:
+            if self._rt_ctx is not None:
+                self._rt_ctx.__exit__(None, None, None)
+        except Exception:
+            pass
+        self._rt_ctx = None
+        self._rt = None
 
     def shutdown(self) -> None:
         """Stop the worker, close channels, and disable the motors."""
         self._stop_event.set()
         if self._worker.is_alive():
             self._worker.join(timeout=2.0)
-        for sub in self._tactile_subs.values():
-            try:
-                sub.close()
-            except Exception:
-                pass
-        if self._glove_frame_sub is not None:
-            try:
-                self._glove_frame_sub.close()
-            except Exception:
-                pass
-        try:
-            self._state_sub.close()
-        except Exception:
-            pass
-        try:
-            if self._publisher is not None:
-                self._publisher.close()
-            if self._rt_ctx is not None:
-                self._rt_ctx.__exit__(None, None, None)
-        except Exception:
-            pass
+        self._teardown_channels()
         try:
             self._hand.disable()
         except Exception:

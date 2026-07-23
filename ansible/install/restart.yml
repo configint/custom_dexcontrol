@@ -6,8 +6,13 @@
     dexmate_ip: "192.168.5.20"
     dexmate_user: "dexmate"
     dexmate_pass: "hello-dex"
-    # Gripper selection: "robotiq" (default, ttyUSB) or "sr_gripper" (EtherCAT).
-    # Override with `-e gripper_type=sr_gripper` on the ansible-playbook CLI.
+    # Gripper selection:
+    #   "robotiq"    -> 2-finger over ttyUSB
+    #   "sr_gripper" -> 2-finger over EtherCAT
+    #   "wuji_hand"  -> Wuji 5-finger hand (USB for Hand 1 / Ethernet for
+    #                   Hand 2; the wuji-sdk driver auto-detects the model and
+    #                   picks each arm's hand by handedness, so no port flag)
+    # Override with `-e gripper_type=wuji_hand` on the ansible-playbook CLI.
     gripper_type: "robotiq"
 
   tasks:
@@ -99,6 +104,25 @@
         right_gripper_port: "{{ sr_iface_list.stdout_lines | last }}"
       when: gripper_type == "sr_gripper"
 
+    # wuji_hand has no serial/EtherCAT port — the wuji-sdk scans and selects
+    # each arm's hand by handedness (or --wuji-sn). Provide empty defaults so
+    # the start/debug tasks don't reference undefined vars.
+    - name: Default empty gripper ports for wuji_hand
+      set_fact:
+        left_gripper_port: ""
+        right_gripper_port: ""
+      when: gripper_type in ["wuji_hand", "wuji_hand_2"]
+
+    - name: Verify wuji-sdk is installed in the robot env on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot && python -c "import wuji_sdk" \
+           || (conda activate robot && pip install wuji-sdk && python -c "import wuji_sdk")'
+      args:
+        executable: /bin/bash
+      become: false
+      when: gripper_type in ["wuji_hand", "wuji_hand_2"]
+
     - name: Display gripper port assignments
       debug:
         msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
@@ -116,9 +140,13 @@
     # The gripper-port flag differs between gripper types:
     #   robotiq      -> --robotiq-comport <ttyUSB>
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
+    #   wuji_hand    -> (no port flag; wuji-sdk selects by handedness/SN)
     - name: Resolve gripper-port CLI flag
       set_fact:
-        gripper_port_flag: "{{ '--gripper-iface' if gripper_type == 'sr_gripper' else '--robotiq-comport' }}"
+        gripper_port_flag: >-
+          {{ '' if gripper_type in ['wuji_hand', 'wuji_hand_2']
+             else '--gripper-iface' if gripper_type == 'sr_gripper'
+             else '--robotiq-comport' }}
 
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
