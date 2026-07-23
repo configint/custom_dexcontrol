@@ -128,6 +128,8 @@ class VegaRobot:
         ik_solver_type: str = "pink",
         use_velocity_feedforward: bool = False,
         robotiq_comport: str = "/dev/ttyUSB0",
+        wuji_sn: str | None = None,
+        wuji_effort_limit: float = 1.5,
         ema_alpha: float = 0.0,
         interpolation_method: str = "none",
         interpolation_history: int = 4,
@@ -184,6 +186,13 @@ class VegaRobot:
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
             self.hand = SrGripperAdapter(comport=self._robotiq_comport)
+        elif gripper_type in ("wuji_hand", "wuji_hand_2"):
+            from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
+            self.hand = WujiHandAdapter(
+                handedness=arm_side,
+                sn=wuji_sn,
+                effort_limit=wuji_effort_limit,
+            )
         else:
             self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
 
@@ -283,6 +292,7 @@ class VegaRobot:
         # Latest raw command stored by add_command_point for the control loop
         self._latest_target_joint_pos: np.ndarray | None = None
         self._latest_gripper_action: float = 0.0
+        self._latest_hand_action: np.ndarray | None = None
         self._latest_gripper_action_space: str = "position"
         self._interp_lock = threading.Lock()
 
@@ -523,6 +533,88 @@ class VegaRobot:
         with self._gripper_state_lock:
             return np.asarray(self._gripper_joint_pos, dtype=np.float64).copy()
 
+    def _hand_dof(self) -> int:
+        """End-effector DoF: N for a multi-finger hand, else 1 (scalar gripper).
+
+        Prefer the component's joint_name list (cached at init): it is the
+        reliable DoF for hand components (6 for F5D6, 20 for Wuji) and does NOT
+        depend on live hardware state — unlike get_joint_pos(), which may raise
+        until the first state arrives and would make this fall back to 1
+        mid-run, rejecting the multi-DoF hand action. Scalar grippers
+        (Robotiq/SR) have no joint_name, so fall back to get_joint_pos().size
+        for them.
+        """
+        if self.hand is None:
+            return 1
+        try:
+            names = getattr(self.hand, "joint_name", None)
+            if names:
+                n = len(names)
+                return n if n > 1 else 1
+        except Exception:
+            pass
+        try:
+            n = int(np.asarray(self.hand.get_joint_pos()).size)
+        except Exception:
+            n = 1
+        return n if n > 1 else 1
+
+    def _split_arm_hand_action(self, action: np.ndarray, arm_dof: int, action_space: str):
+        """Split a flat action into (arm_action, hand_action).
+
+        Accepts both the legacy scalar-gripper length (arm_dof+1) and the
+        multi-finger length (arm_dof+hand_dof). Returns hand_action as a 1-D
+        array (length 1 for scalar gripper, N for a multi-DoF hand).
+        """
+        hand_dof = self._hand_dof()
+        expected = arm_dof + hand_dof
+        n = action.shape[0]
+        if n == expected:
+            return action[:arm_dof], action[arm_dof:expected]
+        # Back-compat: a scalar-gripper command (arm_dof+1) is always allowed.
+        if n == arm_dof + 1:
+            return action[:arm_dof], action[arm_dof:arm_dof + 1]
+        raise ValueError(
+            f"{action_space} expects {expected} values "
+            f"(arm {arm_dof} + hand {hand_dof}), got {n}"
+        )
+
+    def _apply_hand_action(
+        self,
+        hand_action: np.ndarray,
+        gripper_action_space: str,
+        blocking: bool,
+    ) -> None:
+        """Send the end-effector command.
+
+        Scalar (length 1) → existing normalized gripper pipeline.
+        Multi-DoF (length>1) → direct joint-position command on the hand,
+        bypassing the [0,1] scalar collapse. Clamped to the hand's soft joint
+        limits when the driver exposes them (last line of defense — the
+        upstream controller clamps too).
+        """
+        if hand_action.size <= 1:
+            self.update_gripper(
+                float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0,
+                velocity=(gripper_action_space == "velocity"),
+                blocking=blocking,
+            )
+            return
+        if self.hand is None:
+            return
+        target = np.asarray(hand_action, dtype=np.float64)
+        limits = getattr(self.hand, "joint_limits", None)
+        if limits is not None and np.asarray(limits).shape == (target.size, 2):
+            limits = np.asarray(limits, dtype=np.float64)
+            target = np.clip(target, limits[:, 0], limits[:, 1])
+        wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
+        try:
+            with self._gripper_io_lock:
+                self.hand.set_joint_pos(target, wait_time=wait_time)
+            self._prev_gripper_command_successful = True
+        except Exception:
+            self._prev_gripper_command_successful = False
+
     def update_command(
         self,
         command: np.ndarray,
@@ -540,16 +632,8 @@ class VegaRobot:
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
-        if action_space.startswith("joint"):
-            if action.shape[0] != 8:
-                raise ValueError(f"{action_space} expects 8 values, got {action.shape[0]}")
-            arm_action = action[:7]
-            gripper_action = float(action[7])
-        else:
-            if action.shape[0] != 7:
-                raise ValueError(f"{action_space} expects 7 values, got {action.shape[0]}")
-            arm_action = action[:6]
-            gripper_action = float(action[6])
+        arm_dof = 7 if action_space.startswith("joint") else 6
+        arm_action, hand_action = self._split_arm_hand_action(action, arm_dof, action_space)
 
         if action_space == "joint_position":
             target_joint_pos = arm_action
@@ -595,11 +679,7 @@ class VegaRobot:
 
         try:
             self.update_joints(target_joint_pos, velocity=False, blocking=blocking)
-            self.update_gripper(
-                gripper_action,
-                velocity=(gripper_action_space == "velocity"),
-                blocking=blocking,
-            )
+            self._apply_hand_action(hand_action, gripper_action_space, blocking=blocking)
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -638,16 +718,8 @@ class VegaRobot:
         state_dict, _ = self.get_robot_state()
         current_joint_pos = np.asarray(state_dict["joint_positions"], dtype=np.float64)
 
-        if action_space.startswith("joint"):
-            if action.shape[0] != 8:
-                raise ValueError(f"{action_space} expects 8 values, got {action.shape[0]}")
-            arm_action = action[:7]
-            gripper_action = float(action[7])
-        else:
-            if action.shape[0] != 7:
-                raise ValueError(f"{action_space} expects 7 values, got {action.shape[0]}")
-            arm_action = action[:6]
-            gripper_action = float(action[6])
+        arm_dof = 7 if action_space.startswith("joint") else 6
+        arm_action, hand_action = self._split_arm_hand_action(action, arm_dof, action_space)
 
         if action_space == "joint_position":
             target_joint_pos = arm_action
@@ -664,7 +736,9 @@ class VegaRobot:
         with self._interp_lock:
             self._interpolator.add_point(timestamp, target_joint_pos)
             self._latest_target_joint_pos = target_joint_pos.copy()
-            self._latest_gripper_action = gripper_action
+            # Store the full end-effector action (1 scalar gripper, or N-DoF hand).
+            self._latest_hand_action = np.asarray(hand_action, dtype=np.float64).copy()
+            self._latest_gripper_action = float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0
             self._latest_gripper_action_space = gripper_action_space
 
     def execute_interpolated_tick(self) -> bool:
@@ -686,7 +760,11 @@ class VegaRobot:
                 pos = self._latest_target_joint_pos.copy()
                 vel = None
 
-            gripper_action = self._latest_gripper_action
+            hand_action = self._latest_hand_action
+            if hand_action is None:
+                hand_action = np.array([self._latest_gripper_action], dtype=np.float64)
+            else:
+                hand_action = hand_action.copy()
             gripper_vel = self._latest_gripper_action_space == "velocity"
 
         # Apply the output filter (Butterworth / EMA) after interpolation.
@@ -711,7 +789,11 @@ class VegaRobot:
 
         try:
             self.update_joints(pos, velocity=False, blocking=False)
-            self.update_gripper(gripper_action, velocity=gripper_vel, blocking=False)
+            self._apply_hand_action(
+                hand_action,
+                "velocity" if gripper_vel else "position",
+                blocking=False,
+            )
             self._prev_command_successful = True
         except (JointLimitExceededError, IKFailedError):
             self._prev_command_successful = False
@@ -938,7 +1020,31 @@ class VegaRobot:
             joint_torques = np.asarray(self.arm.get_joint_torque(), dtype=np.float64)
         except ValueError:
             joint_torques = np.zeros(7, dtype=np.float64)
-        gripper_position = self.get_cached_gripper_position() if self.hand is not None else 0.0
+        # End-effector state under the historical key "gripper_position".
+        # Scalar gripper → float in [0,1]. Multi-finger hand → the full joint
+        # vector (radians), so recorded data preserves all DoF.
+        if self.hand is None:
+            gripper_position = 0.0
+        elif self._hand_dof() > 1:
+            gripper_position = np.asarray(
+                self.hand.get_joint_pos(), dtype=np.float64
+            ).tolist()
+        else:
+            gripper_position = self.get_cached_gripper_position()
+
+        # Tactile: preferred driver accessor (WujiHandAdapter.get_hand_tactile),
+        # with the legacy F5D6_V2 fingertip-force gate kept for the dexbot hand.
+        # Scalar grippers have neither method, so they stay completely
+        # untouched — the key is never added.
+        hand_tactile = None
+        if hasattr(self.hand, "get_hand_tactile"):
+            _force = self.hand.get_hand_tactile()
+            if _force is not None:
+                hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
+        elif hasattr(self.hand, "get_finger_tip_force"):
+            _force = self.hand.get_finger_tip_force()
+            if _force is not None:
+                hand_tactile = np.asarray(_force, dtype=np.float64).tolist()
 
         wrench_state = np.zeros(6, dtype=np.float64)
         if getattr(self.arm, "wrench_sensor", None) is not None:
@@ -967,6 +1073,10 @@ class VegaRobot:
             "prev_command_successful": bool(self._prev_command_successful),
             "prev_gripper_command_successful": bool(self._prev_gripper_command_successful),
         }
+        # Only present for hands with a tactile stream; scalar grippers never
+        # add this key.
+        if hand_tactile is not None:
+            state_dict["hand_tactile"] = hand_tactile
         return state_dict, timestamp_dict
 
     def validate_joint_limits(self, target_joint_pos: np.ndarray) -> None:
@@ -1194,21 +1304,35 @@ class VegaRobot:
         if gripper_action_space is None:
             gripper_action_space = "velocity" if velocity else "position"
 
-        # Extract gripper action
-        if action_space.startswith("joint"):
-            gripper_action = float(action[7])
-        else:
-            gripper_action = float(action[6])
+        # Extract end-effector action
+        arm_dof = 7 if action_space.startswith("joint") else 6
+        _, hand_action = self._split_arm_hand_action(action, arm_dof, action_space)
+        is_multi_hand = hand_action.size > 1
 
-        # Gripper conversions
-        current_gripper = float(robot_state["gripper_position"])
-        if gripper_action_space == "velocity":
-            gripper_position = np.clip(current_gripper + gripper_action * dt, 0.0, 1.0)
+        # End-effector conversions. Names (gripper_position / gripper_delta) are
+        # kept so state/action_info/get_info all agree; values become N-vectors
+        # for the multi-finger hand. Element-wise so the scalar float() path
+        # doesn't blow up on an N-vector.
+        current_gripper = np.asarray(robot_state["gripper_position"], dtype=np.float64).reshape(-1)
+        if is_multi_hand:
+            # Absolute joint-angle command (no [0,1] normalization for the hand).
+            gripper_position = np.asarray(hand_action, dtype=np.float64).reshape(-1)
+            if current_gripper.shape != gripper_position.shape:
+                current_gripper = np.resize(current_gripper, gripper_position.shape)
+            action_dict["gripper_position"] = gripper_position.tolist()
+            action_dict["gripper_delta"] = (gripper_position - current_gripper).tolist()
+            gripper_action = gripper_position  # used below for concat
         else:
-            gripper_position = np.clip(gripper_action, 0.0, 1.0)
-
-        action_dict["gripper_position"] = float(gripper_position)
-        action_dict["gripper_delta"] = float(gripper_position - current_gripper)
+            gripper_action_s = float(hand_action.reshape(-1)[0]) if hand_action.size else 0.0
+            cur = float(current_gripper[0]) if current_gripper.size else 0.0
+            if gripper_action_space == "velocity":
+                gripper_pos_s = float(np.clip(cur + gripper_action_s * dt, 0.0, 1.0))
+            else:
+                gripper_pos_s = float(np.clip(gripper_action_s, 0.0, 1.0))
+            action_dict["gripper_position"] = gripper_pos_s
+            action_dict["gripper_delta"] = float(gripper_pos_s - cur)
+            gripper_position = gripper_pos_s
+            gripper_action = gripper_action_s
 
         # Process action based on space
         current_joint_pos = np.asarray(robot_state["joint_positions"], dtype=np.float64)
@@ -1224,7 +1348,7 @@ class VegaRobot:
                 cart_velocity[3:6] = cart_action[3:6] * _TELEOP_ROT_ACTION_GAIN
                 action_dict["cartesian_velocity"] = cart_velocity.tolist()
                 action_dict["target_cartesian_delta"] = np.concatenate(
-                    [cart_action, [gripper_position]]
+                    [cart_action, np.atleast_1d(gripper_position)]
                 ).tolist()
                 # Compute motor delta using the same logic as the server
                 if max_lin_delta is not None and max_rot_delta is not None:
@@ -1252,7 +1376,9 @@ class VegaRobot:
                 cartesian_velocity = cart_action / dt
                 action_dict["cartesian_velocity"] = cartesian_velocity.tolist()
 
-            action_dict["delta_action"] = np.concatenate([cartesian_delta, [gripper_action]]).tolist()
+            action_dict["delta_action"] = np.concatenate(
+                [cartesian_delta, np.atleast_1d(gripper_action)]
+            ).tolist()
 
             # target_cartesian_delta (add for all cartesian input spaces)
             if "target_cartesian_delta" not in action_dict:
@@ -1260,10 +1386,11 @@ class VegaRobot:
                     cart_action if velocity
                     else action_dict["cartesian_velocity"]
                 )
-                tcd = np.empty(7, dtype=np.float64)
+                gp = np.atleast_1d(gripper_position)
+                tcd = np.empty(6 + gp.size, dtype=np.float64)
                 tcd[:3] = np.asarray(vel_for_tcd[:3]) / _TELEOP_POS_ACTION_GAIN
                 tcd[3:6] = np.asarray(vel_for_tcd[3:6]) / _TELEOP_ROT_ACTION_GAIN
-                tcd[6] = gripper_position
+                tcd[6:] = gp
                 action_dict["target_cartesian_delta"] = tcd.tolist()
 
             # Compute target cartesian position (using simple pose addition)
@@ -1331,7 +1458,7 @@ class VegaRobot:
             self._vel_log_file.close()
             self._vel_log_file = None
         self._stop_gripper_worker()
-        if self.gripper_type in ("robotiq", "sr_gripper") and self.hand is not None:
+        if self.gripper_type in ("robotiq", "sr_gripper", "wuji_hand", "wuji_hand_2") and self.hand is not None:
             try:
                 self.hand.shutdown()
             except Exception:
