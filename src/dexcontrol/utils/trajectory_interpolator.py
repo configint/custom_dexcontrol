@@ -9,10 +9,10 @@ control-rate upsampling (e.g. 20 Hz input → 100 Hz output).
 
 from __future__ import annotations
 
-import numpy as np
 from collections import deque
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Literal, Optional, Tuple
 
+import numpy as np
 from scipy.interpolate import PchipInterpolator, interp1d
 
 
@@ -78,6 +78,57 @@ class TrajectoryInterpolator:
         self._positions.append(np.asarray(positions, dtype=np.float64))
         self._interpolators_dirty = True
 
+    def set_linear_target(
+        self,
+        timestamp: float,
+        target_positions: np.ndarray,
+        *,
+        initial_positions: np.ndarray,
+        duration_s: float,
+    ) -> None:
+        """Plan a causal linear segment from the current command to a target.
+
+        A target received at ``timestamp`` cannot be interpolated from a future
+        sample that has not arrived yet.  Instead, sample the currently active
+        command at that instant and schedule the new target one nominal input
+        period into the future.  Replanning from the sampled command keeps
+        position continuous even when input packets arrive early or late.
+
+        This method intentionally supports only ``method="linear"``.  Future
+        interpolation methods can provide their own segment planner while the
+        control loop continues deriving velocity from the sampled positions.
+        """
+        if self.method != "linear":
+            raise ValueError("set_linear_target requires method='linear'")
+
+        start_time = float(timestamp)
+        duration = float(duration_s)
+        target = np.asarray(target_positions, dtype=np.float64)
+        initial = np.asarray(initial_positions, dtype=np.float64)
+
+        if not np.isfinite(start_time):
+            raise ValueError("timestamp must be finite")
+        if not np.isfinite(duration) or duration <= 0.0:
+            raise ValueError("duration_s must be finite and positive")
+        if (
+            target.ndim != 1
+            or initial.ndim != 1
+            or target.shape != initial.shape
+            or not np.all(np.isfinite(target))
+            or not np.all(np.isfinite(initial))
+        ):
+            raise ValueError(
+                "target_positions and initial_positions must be finite, "
+                "same-shaped 1-D arrays"
+            )
+
+        current, _ = self.interpolate(start_time, compute_velocity=False)
+        start = initial.copy() if current is None else current
+
+        self.clear()
+        self.add_point(start_time, start)
+        self.add_point(start_time + duration, target)
+
     def interpolate(
         self,
         query_time: float,
@@ -117,9 +168,9 @@ class TrajectoryInterpolator:
             self._prev_time = query_time
             return pos, vel
 
-        # Clamp into [small_margin, t_span) for valid interpolation.
-        margin = 1e-4
-        clamped = float(np.clip(rel_t, margin, max(t_span - margin, margin + 1e-4)))
+        # Clamp to the planned interval.  Evaluating the exact start point is
+        # important when a segment is replanned from the current command.
+        clamped = float(np.clip(rel_t, 0.0, t_span))
 
         pos = np.asarray(interp(clamped), dtype=np.float64)
 
@@ -135,7 +186,7 @@ class TrajectoryInterpolator:
                     vel = np.zeros_like(pos)
             else:
                 dt_back = 0.01
-                t_prev = max(clamped - dt_back, margin)
+                t_prev = max(clamped - dt_back, 0.0)
                 actual_dt = clamped - t_prev
                 if actual_dt > 0:
                     vel = (pos - np.asarray(interp(t_prev), dtype=np.float64)) / actual_dt

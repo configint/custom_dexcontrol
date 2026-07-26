@@ -1,4 +1,4 @@
-"""Joint-target velocity feedforward estimation for the Vega controller.
+"""Commanded-trajectory velocity feedforward estimation for Vega.
 
 Velocity feedforward must describe the motion of the commanded joint
 trajectory.  It must not be derived from the tracking error between a target
@@ -12,13 +12,14 @@ import numpy as np
 
 
 class TargetVelocityFeedforward:
-    """Estimate feedforward velocity from consecutive joint targets.
+    """Estimate feedforward velocity from commanded joint-position samples.
 
-    Each call to :meth:`update` consumes one input-rate joint target.  The
-    returned velocity is the finite difference between consecutive targets
-    over the configured nominal input period, optionally smoothed and scaled,
-    in radians/second.  Arrival timestamps are used only to detect a stale
-    command stream; network and scheduler jitter must not change velocity.
+    Each call to :meth:`update` consumes one position sample from either the
+    input target stream or the interpolated output trajectory.  The returned
+    velocity is the finite difference between consecutive samples over the
+    configured nominal period, optionally smoothed and scaled, in
+    radians/second.  Arrival timestamps are used only to detect a stale command
+    stream; network and scheduler jitter must not change the denominator.
     """
 
     def __init__(
@@ -58,7 +59,7 @@ class TargetVelocityFeedforward:
         self._velocity = None
 
     def update(self, target: np.ndarray, timestamp: float) -> np.ndarray:
-        """Update the estimate from a new input-rate joint target."""
+        """Update the estimate from a commanded joint-position sample."""
         target_array = np.asarray(target, dtype=np.float64)
         current_timestamp = float(timestamp)
 

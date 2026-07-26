@@ -141,6 +141,7 @@ class VegaRobot:
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
+        control_loop_hz: int = 0,
         **kwargs,
     ):
         hand_type = kwargs.pop("hand_type", None)
@@ -166,6 +167,11 @@ class VegaRobot:
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.control_hz = int(control_hz)
+        self.control_loop_hz = (
+            int(control_loop_hz) if int(control_loop_hz) > 0 else self.control_hz
+        )
+        self._input_dt_s = 1.0 / max(1, self.control_hz)
+        self._output_dt_s = 1.0 / max(1, self.control_loop_hz)
         self.gripper_type = gripper_type
         self.use_velocity_feedforward = bool(use_velocity_feedforward)
 
@@ -219,16 +225,23 @@ class VegaRobot:
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._vel_ratio = float(vel_ratio)
         self._velocity_feedforward = TargetVelocityFeedforward(
-            nominal_dt_s=1.0 / max(1, self.control_hz),
-            velocity_ratio=vel_ratio,
+            nominal_dt_s=self._input_dt_s,
+            velocity_ratio=self._vel_ratio,
             smoothing_alpha=self._vel_smoothing_alpha,
-            stale_timeout_s=2.0 / max(1, self.control_hz),
+            stale_timeout_s=2.0 * self._input_dt_s,
+        )
+        self._interpolated_velocity_feedforward = TargetVelocityFeedforward(
+            nominal_dt_s=self._output_dt_s,
+            velocity_ratio=self._vel_ratio,
+            smoothing_alpha=self._vel_smoothing_alpha,
+            stale_timeout_s=2.0 * self._input_dt_s,
         )
         if vel_damp_thresh != 0.05:
             _logger.warning(
                 "vel_damp_thresh is deprecated and ignored: velocity feedforward "
-                "is now derived only from consecutive joint targets"
+                "is now derived only from the commanded joint trajectory"
             )
 
         # Velocity logging for diagnostics.
@@ -258,9 +271,12 @@ class VegaRobot:
                 history_size=interpolation_history,
             )
             _logger.info(
-                "Trajectory interpolation enabled: method=%s history=%d",
+                "Trajectory interpolation enabled: method=%s history=%d "
+                "input=%dHz output=%dHz",
                 interpolation_method,
                 interpolation_history,
+                self.control_hz,
+                self.control_loop_hz,
             )
         else:
             self._interpolator = None
@@ -275,7 +291,7 @@ class VegaRobot:
                 filter_cfg["default"]["alpha"] = filter_ema_alpha
             self._output_filter = MultiChannelFilter(
                 filter_config=filter_cfg,
-                control_rate=float(control_hz),
+                control_rate=float(self.control_loop_hz),
             )
             _logger.info(
                 "Output filter enabled: type=%s (cutoff=%.1f order=%d ema_alpha=%.2f)",
@@ -309,6 +325,7 @@ class VegaRobot:
                 "log_path": self._AGENT_DEBUG_LOG_PATH,
                 "arm_side": self.arm_side,
                 "control_hz": self.control_hz,
+                "control_loop_hz": self.control_loop_hz,
                 "ik_solver_type": self._ik_solver_type,
             },
         )
@@ -388,6 +405,7 @@ class VegaRobot:
         self._last_cmd_joint_pos = None
         self._prev_cmd_delta = None
         self._velocity_feedforward.reset()
+        self._interpolated_velocity_feedforward.reset()
         if self._interpolator is not None:
             self._interpolator.clear()
         if self._output_filter is not None:
@@ -682,9 +700,15 @@ class VegaRobot:
 
         timestamp = _time.perf_counter()
         with self._interp_lock:
-            self._interpolator.add_point(timestamp, target_joint_pos)
-            if self.use_velocity_feedforward:
-                self._velocity_feedforward.update(target_joint_pos, timestamp)
+            if self._interpolation_method == "linear":
+                self._interpolator.set_linear_target(
+                    timestamp,
+                    target_joint_pos,
+                    initial_positions=current_joint_pos,
+                    duration_s=self._input_dt_s,
+                )
+            else:
+                self._interpolator.add_point(timestamp, target_joint_pos)
             self._latest_target_joint_pos = target_joint_pos.copy()
             self._latest_gripper_action = gripper_action
             self._latest_gripper_action_space = gripper_action_space
@@ -710,12 +734,6 @@ class VegaRobot:
                 # Not enough data for interpolation — use latest raw target.
                 pos = self._latest_target_joint_pos.copy()
 
-            target_joint_vel = (
-                self._velocity_feedforward.sample(now)
-                if self.use_velocity_feedforward
-                else None
-            )
-
             gripper_action = self._latest_gripper_action
             gripper_vel = self._latest_gripper_action_space == "velocity"
 
@@ -725,7 +743,7 @@ class VegaRobot:
 
         # Apply existing EMA 2nd-order smoothing on top if enabled.
         if self._ema_alpha > 0.0:
-            dt = 1.0 / max(1, self.control_hz)
+            dt = self._output_dt_s
             if self._filter_pos is None:
                 self._filter_pos = pos.copy()
                 self._filter_vel = np.zeros_like(pos)
@@ -738,6 +756,17 @@ class VegaRobot:
                 self._filter_pos = pos + (err + c * dt) * exp_term
                 self._filter_vel = (self._filter_vel - c * omega * dt) * exp_term
                 pos = self._filter_pos.copy()
+
+        target_joint_vel = None
+        if self.use_velocity_feedforward:
+            # Differentiate the position command that this output tick
+            # actually produced.  With a 200 Hz control loop this is
+            # (q_des[k] - q_des[k-1]) / 0.005, so position and velocity stay
+            # consistent even when the interpolation method changes later.
+            target_joint_vel = self._interpolated_velocity_feedforward.update(
+                pos,
+                now,
+            )
 
         try:
             self.update_joints(

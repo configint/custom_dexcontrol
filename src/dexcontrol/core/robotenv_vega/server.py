@@ -124,6 +124,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             robot_model=robot_model,
             arm_side=arm_side,
             control_hz=control_hz,
+            control_loop_hz=control_loop_hz,
             use_velocity_feedforward=use_velocity_feedforward,
             gripper_type=gripper_type,
             ik_solver_type=ik_solver_type,
@@ -191,7 +192,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         LOGGER.info(
             "Joint command mode: %s",
             (
-                "position+target-derivative velocity feedforward"
+                (
+                    "position+output-trajectory-derivative velocity feedforward"
+                    if interpolation_method != "none" and control_loop_hz > 0
+                    else "position+target-derivative velocity feedforward"
+                )
                 if self.use_velocity_feedforward
                 else "position-only"
             ),

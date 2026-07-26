@@ -15,6 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `max_*_delta`; it only norm-clips commands that exceed the configured
   physical per-step limits. Legacy `cartesian_velocity` semantics are
   unchanged.
+- Vega linear interpolation now plans each input-rate joint target over one
+  nominal input period instead of immediately holding the newest target.
+  Velocity feedforward in the interpolated path is derived from consecutive
+  output-rate `q_des` samples, using the configured control-loop period, so the
+  position and velocity commands describe the same trajectory.
 
 ## [0.5.0] - 2026-06-03
 

@@ -60,17 +60,20 @@ robot = VegaRobot(
 ### Architecture
 
 ```
-gRPC Step() (~20Hz)              Background Control Loop (100Hz)
+gRPC Step() (~20Hz)            Background Control Loop (100-200Hz)
      |                                    |
      v                                    v
 add_command_point()              execute_interpolated_tick()
      |                                    |
      v                                    v
-TrajectoryInterpolator           interpolate(now) -> pos, vel
+TrajectoryInterpolator           interpolate(now) -> q_des
   (PCHIP cubic / linear)                  |
                                           v
                                   MultiChannelFilter
                                   (Butterworth / EMA)
+                                          |
+                                          v
+                              output-rate Δq_des / dt -> qdot_des
                                           |
                                           v
                                   update_joints() -> hardware
