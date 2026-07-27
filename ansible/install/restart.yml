@@ -139,7 +139,7 @@
             --max-delta-scale 3.0 \
             --max-jerk 0 \
             --rot-sensitivity 2.0 \
-            --vel-ratio 1.0" C-m
+            --vel-ratio 0.8" C-m
         sleep 0.5
         tmux split-window -v -t robot-server
         tmux send-keys -t robot-server.1 "conda activate robot && python ~/custom_dexcontrol/src/dexcontrol/core/robotenv_vega/server.py \
@@ -157,7 +157,7 @@
             --max-delta-scale 3.0 \
             --max-jerk 0 \
             --rot-sensitivity 2.0 \
-            --vel-ratio 1.0" C-m
+            --vel-ratio 0.8" C-m
         ENDSSH
       args:
         executable: /bin/bash
