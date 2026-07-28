@@ -305,6 +305,7 @@ class VegaRobot:
 
         # Latest raw command stored by add_command_point for the control loop
         self._latest_target_joint_pos: np.ndarray | None = None
+        self._latest_input_timestamp: float | None = None
         self._latest_gripper_action: float = 0.0
         self._latest_gripper_action_space: str = "position"
         self._interp_lock = threading.Lock()
@@ -411,6 +412,7 @@ class VegaRobot:
         if self._output_filter is not None:
             self._output_filter.reset()
         self._latest_target_joint_pos = None
+        self._latest_input_timestamp = None
 
     def launch_robot(self) -> None:
         """Validate robot readiness and default control mode."""
@@ -710,6 +712,7 @@ class VegaRobot:
             else:
                 self._interpolator.add_point(timestamp, target_joint_pos)
             self._latest_target_joint_pos = target_joint_pos.copy()
+            self._latest_input_timestamp = timestamp
             self._latest_gripper_action = gripper_action
             self._latest_gripper_action_space = gripper_action_space
 
@@ -736,6 +739,7 @@ class VegaRobot:
 
             gripper_action = self._latest_gripper_action
             gripper_vel = self._latest_gripper_action_space == "velocity"
+            latest_input_timestamp = self._latest_input_timestamp
 
         # Apply the output filter (Butterworth / EMA) after interpolation.
         if self._output_filter is not None:
@@ -759,14 +763,37 @@ class VegaRobot:
 
         target_joint_vel = None
         if self.use_velocity_feedforward:
-            # Differentiate the position command that this output tick
-            # actually produced.  With a 200 Hz control loop this is
-            # (q_des[k] - q_des[k-1]) / 0.005, so position and velocity stay
-            # consistent even when the interpolation method changes later.
-            target_joint_vel = self._interpolated_velocity_feedforward.update(
-                pos,
-                now,
-            )
+            if (
+                self._interpolation_method == "linear"
+                and latest_input_timestamp is not None
+            ):
+                # Follow the sampled trajectory for one input period.  If the
+                # next input is slightly late, keep publishing the endpoint
+                # position and last velocity-feedforward sample for one more
+                # input period.  Only then hold the same position with zero
+                # feedforward.  This is a zero-order hold of the last
+                # impedance reference, not trajectory extrapolation.
+                target_joint_vel = (
+                    self._interpolated_velocity_feedforward.update_for_command_age(
+                        pos,
+                        now,
+                        command_age_s=max(
+                            0.0, now - latest_input_timestamp
+                        ),
+                        trajectory_duration_s=self._input_dt_s,
+                        hold_timeout_s=2.0 * self._input_dt_s,
+                    )
+                )
+            else:
+                # Differentiate the position command that this output tick
+                # actually produced.  With a 200 Hz control loop this is
+                # (q_des[k] - q_des[k-1]) / 0.005.
+                target_joint_vel = (
+                    self._interpolated_velocity_feedforward.update(
+                        pos,
+                        now,
+                    )
+                )
 
         try:
             self.update_joints(

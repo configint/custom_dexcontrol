@@ -112,6 +112,91 @@ class TargetVelocityFeedforwardTests(unittest.TestCase):
 
         np.testing.assert_allclose(velocity, [0.0])
 
+    def test_command_age_holds_last_velocity_for_one_input_period(self) -> None:
+        estimator = TargetVelocityFeedforward(
+            nominal_dt_s=0.005,
+            smoothing_alpha=1.0,
+            stale_timeout_s=0.1,
+        )
+        estimator.update_for_command_age(
+            np.array([0.0]),
+            timestamp=5.0,
+            command_age_s=0.0,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+        moving_velocity = estimator.update_for_command_age(
+            np.array([0.1]),
+            timestamp=5.005,
+            command_age_s=0.005,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+
+        held_velocity = estimator.update_for_command_age(
+            np.array([1.0]),
+            timestamp=5.055,
+            command_age_s=0.055,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+
+        np.testing.assert_allclose(moving_velocity, [20.0])
+        np.testing.assert_allclose(held_velocity, moving_velocity)
+
+    def test_command_age_zeroes_velocity_after_hold_timeout(self) -> None:
+        estimator = TargetVelocityFeedforward(
+            nominal_dt_s=0.005,
+            smoothing_alpha=1.0,
+            stale_timeout_s=0.1,
+        )
+        estimator.update(np.array([0.0]), timestamp=6.0)
+        estimator.update(np.array([0.1]), timestamp=6.005)
+
+        at_timeout = estimator.update_for_command_age(
+            np.array([0.1]),
+            timestamp=6.1,
+            command_age_s=0.1,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+        after_timeout = estimator.update_for_command_age(
+            np.array([0.1]),
+            timestamp=6.105,
+            command_age_s=0.105,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+
+        np.testing.assert_allclose(at_timeout, [20.0])
+        np.testing.assert_allclose(after_timeout, [0.0])
+
+    def test_held_position_refresh_avoids_resume_difference_spike(self) -> None:
+        estimator = TargetVelocityFeedforward(
+            nominal_dt_s=0.005,
+            smoothing_alpha=1.0,
+            stale_timeout_s=0.1,
+        )
+        estimator.update(np.array([0.0]), timestamp=7.0)
+        estimator.update(np.array([0.1]), timestamp=7.005)
+        estimator.update_for_command_age(
+            np.array([1.0]),
+            timestamp=7.055,
+            command_age_s=0.055,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+
+        resumed_velocity = estimator.update_for_command_age(
+            np.array([1.1]),
+            timestamp=7.06,
+            command_age_s=0.005,
+            trajectory_duration_s=0.05,
+            hold_timeout_s=0.1,
+        )
+
+        np.testing.assert_allclose(resumed_velocity, [20.0])
+
 
 if __name__ == "__main__":
     unittest.main()

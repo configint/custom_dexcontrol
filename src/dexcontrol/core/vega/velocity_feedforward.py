@@ -101,6 +101,88 @@ class TargetVelocityFeedforward:
         self._velocity = velocity.copy()
         return velocity.copy()
 
+    def hold(
+        self,
+        target: np.ndarray,
+        timestamp: float,
+        *,
+        zero_velocity: bool = False,
+    ) -> np.ndarray:
+        """Refresh the held position sample without re-differentiating it.
+
+        A causal trajectory can reach its endpoint just before the next
+        input-rate command arrives.  Re-differentiating the repeated endpoint
+        would immediately replace the last motion feedforward with zero.  This
+        method advances the position/timestamp history while preserving the
+        last feedforward sample for a bounded grace period.  Callers can force
+        the held velocity to zero when the input command timeout expires.
+        """
+        target_array = np.asarray(target, dtype=np.float64)
+        current_timestamp = float(timestamp)
+
+        if target_array.ndim != 1 or not np.all(np.isfinite(target_array)):
+            raise ValueError("target must be a finite 1-D array")
+        if not np.isfinite(current_timestamp):
+            raise ValueError("timestamp must be finite")
+
+        if (
+            zero_velocity
+            or self._velocity is None
+            or self._velocity.shape != target_array.shape
+        ):
+            velocity = np.zeros_like(target_array)
+        else:
+            velocity = self._velocity.copy()
+
+        self._previous_target = target_array.copy()
+        self._previous_timestamp = current_timestamp
+        self._velocity = velocity.copy()
+        return velocity.copy()
+
+    def update_for_command_age(
+        self,
+        target: np.ndarray,
+        timestamp: float,
+        *,
+        command_age_s: float,
+        trajectory_duration_s: float,
+        hold_timeout_s: float,
+    ) -> np.ndarray:
+        """Update, hold, or stop feedforward based on input command age.
+
+        The trajectory derivative is used while the planned segment is
+        active.  After the segment ends, the last position and feedforward
+        sample are held until ``hold_timeout_s``.  Once that input-age timeout
+        expires, the held position is retained with exactly zero feedforward.
+        """
+        command_age = float(command_age_s)
+        trajectory_duration = float(trajectory_duration_s)
+        hold_timeout = float(hold_timeout_s)
+
+        if not np.isfinite(command_age) or command_age < 0.0:
+            raise ValueError("command_age_s must be finite and non-negative")
+        if not np.isfinite(trajectory_duration) or trajectory_duration <= 0.0:
+            raise ValueError(
+                "trajectory_duration_s must be finite and positive"
+            )
+        if (
+            not np.isfinite(hold_timeout)
+            or hold_timeout < trajectory_duration
+        ):
+            raise ValueError(
+                "hold_timeout_s must be finite and no shorter than "
+                "trajectory_duration_s"
+            )
+
+        if command_age <= trajectory_duration:
+            return self.update(target, timestamp)
+
+        return self.hold(
+            target,
+            timestamp,
+            zero_velocity=command_age > hold_timeout,
+        )
+
     def sample(self, timestamp: float) -> np.ndarray | None:
         """Return the latest estimate, or zero if the input stream is stale."""
         if (
