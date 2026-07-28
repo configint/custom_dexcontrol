@@ -18,6 +18,7 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 from .cartesian_commands import (
+    absolute_cartesian_target_to_delta,
     clip_physical_cartesian_delta,
     normalized_cartesian_velocity_to_delta,
 )
@@ -100,6 +101,7 @@ SUPPORTED_ACTION_SPACES = (
     "joint_delta",
     "cartesian_velocity",
     "cartesian_delta",
+    "target_cartesian",
     "target_cartesian_delta",
 )
 
@@ -140,6 +142,8 @@ class VegaRobot:
         max_jerk: float = 0.25,
         vel_ratio: float = 1.0,
         vel_damp_thresh: float = 0.05,
+        max_linear_delta: float = 0.075,
+        max_rotation_delta: float = 0.3,
         head_init_pos: tuple[float, ...] | list[float] = (2.0, 0.0, -0.3),
         control_loop_hz: int = 0,
         **kwargs,
@@ -225,6 +229,8 @@ class VegaRobot:
         self._HW_CORRECTION_OUTLIER_THRESH = 0.5  # If |hw - cmd| > this, skip correction for that joint entirely
         self._max_delta_scale = float(max(0.1, max_delta_scale))
         self._MOTOR_MAX_JERK_RAD = float(max(0.0, max_jerk))
+        self._max_linear_cartesian_delta = float(max_linear_delta)
+        self._max_rotation_cartesian_delta = float(max_rotation_delta)
         self._vel_ratio = float(vel_ratio)
         self._velocity_feedforward = TargetVelocityFeedforward(
             nominal_dt_s=self._input_dt_s,
@@ -587,6 +593,8 @@ class VegaRobot:
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+        elif action_space == "target_cartesian":
+            target_joint_pos = self._solve_cartesian_target(arm_action)
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
 
@@ -697,6 +705,8 @@ class VegaRobot:
             target_joint_pos = current_joint_pos + arm_action
         elif action_space == "cartesian_velocity":
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3] * dt, arm_action[3:6] * dt)
+        elif action_space == "target_cartesian":
+            target_joint_pos = self._solve_cartesian_target(arm_action)
         else:  # cartesian_delta
             target_joint_pos = self._solve_cartesian_delta(arm_action[:3], arm_action[3:6])
 
@@ -1133,17 +1143,25 @@ class VegaRobot:
         except Exception:
             pass
 
-    def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
-        # Gradual correction: use last command + outlier-rejected hw correction as IK start
+    def _get_corrected_ik_seed(self) -> np.ndarray:
+        """Return the latest command state corrected toward hardware feedback."""
         hw_pos = np.asarray(self.arm.get_joint_pos(), dtype=np.float64)
         if self._last_cmd_joint_pos is not None:
             raw_error = hw_pos - self._last_cmd_joint_pos
             outlier_mask = np.abs(raw_error) > self._HW_CORRECTION_OUTLIER_THRESH
             raw_error[outlier_mask] = 0.0
-            actual_joints = self._last_cmd_joint_pos + raw_error * self._HW_CORRECTION_ALPHA
-        else:
-            actual_joints = hw_pos
-        self.sync_motion_manager_with_arm(actual_joints)
+            return (
+                self._last_cmd_joint_pos
+                + raw_error * self._HW_CORRECTION_ALPHA
+            )
+        return hw_pos
+
+    def _run_cartesian_delta_ik(
+        self,
+        delta_xyz: np.ndarray,
+        delta_rpy: np.ndarray,
+    ) -> np.ndarray:
+        """Run the existing delta IK after the motion manager has been synced."""
         try:
             target_joint_pos = self.ik_controller.move_delta_cartesian(
                 delta_xyz=np.asarray(delta_xyz, dtype=np.float64),
@@ -1157,6 +1175,47 @@ class VegaRobot:
         if target_joint_pos.shape[0] != 7:
             raise IKFailedError(f"IK returned invalid joint vector shape: {target_joint_pos.shape}")
         return target_joint_pos
+
+    def _solve_cartesian_delta(self, delta_xyz: np.ndarray, delta_rpy: np.ndarray) -> np.ndarray:
+        # Gradual correction: use last command + outlier-rejected hw correction as IK start.
+        actual_joints = self._get_corrected_ik_seed()
+        self.sync_motion_manager_with_arm(actual_joints)
+        return self._run_cartesian_delta_ik(delta_xyz, delta_rpy)
+
+    def _solve_cartesian_target(self, target_pose: np.ndarray) -> np.ndarray:
+        """Solve an absolute pose from the latest corrected robot state.
+
+        Recomputing the pose error here avoids applying an Oculus delta that
+        was calculated from an older observation.  The bounded delta then
+        follows the same IK implementation as the existing Cartesian path.
+        """
+        target_pose = np.asarray(target_pose, dtype=np.float64)
+        if target_pose.shape != (6,) or not np.all(np.isfinite(target_pose)):
+            raise IKFailedError(
+                f"Absolute Cartesian target must be a finite 6-vector, got {target_pose}"
+            )
+
+        actual_joints = self._get_corrected_ik_seed()
+        try:
+            current_pose = self._get_cartesian_pose(
+                joint_positions=actual_joints,
+            )
+            cartesian_delta = absolute_cartesian_target_to_delta(
+                target_pose,
+                current_pose,
+                max_linear_delta=self._max_linear_cartesian_delta,
+                max_rotation_delta=self._max_rotation_cartesian_delta,
+            )
+        except Exception as exc:
+            raise IKFailedError(
+                f"Failed to convert absolute Cartesian target: {exc}"
+            ) from exc
+
+        self.sync_motion_manager_with_arm(actual_joints)
+        return self._run_cartesian_delta_ik(
+            cartesian_delta[:3],
+            cartesian_delta[3:6],
+        )
 
     def _init_gripper_reference(self) -> tuple[np.ndarray, np.ndarray]:
         if self.hand is None:
@@ -1294,10 +1353,35 @@ class VegaRobot:
         current_joint_pos = np.asarray(robot_state["joint_positions"], dtype=np.float64)
         current_cart_pos = np.asarray(robot_state["cartesian_position"], dtype=np.float64)
 
-        if action_space.startswith("cartesian") or action_space == "target_cartesian_delta":
+        if (
+            action_space.startswith("cartesian")
+            or action_space in ("target_cartesian", "target_cartesian_delta")
+        ):
             cart_action = action[:6]
 
-            if action_space == "target_cartesian_delta":
+            if action_space == "target_cartesian":
+                action_dict["cartesian_position"] = cart_action.tolist()
+                cartesian_delta = absolute_cartesian_target_to_delta(
+                    cart_action,
+                    current_cart_pos,
+                    max_linear_delta=(
+                        self._max_linear_cartesian_delta
+                        if max_lin_delta is None
+                        else max_lin_delta
+                    ),
+                    max_rotation_delta=(
+                        self._max_rotation_cartesian_delta
+                        if max_rot_delta is None
+                        else max_rot_delta
+                    ),
+                )
+                action_dict["cartesian_velocity"] = (
+                    cartesian_delta / dt
+                ).tolist()
+                action_dict["target_cartesian_delta"] = np.concatenate(
+                    [cartesian_delta, [gripper_position]]
+                ).tolist()
+            elif action_space == "target_cartesian_delta":
                 # Physical pose error: preserve small commands and clip only
                 # when their linear/rotational norms exceed the safety caps.
                 action_dict["target_cartesian_delta"] = np.concatenate(
@@ -1343,14 +1427,21 @@ class VegaRobot:
                 action_dict["target_cartesian_delta"] = tcd.tolist()
 
             # Compute target cartesian position (using simple pose addition)
-            target_cart = current_cart_pos.copy()
-            target_cart[:3] += cartesian_delta[:3]  # xyz
-            target_cart[3:6] += cartesian_delta[3:6]  # rpy
-            action_dict["cartesian_position"] = target_cart.tolist()
+            if action_space != "target_cartesian":
+                target_cart = current_cart_pos.copy()
+                target_cart[:3] += cartesian_delta[:3]  # xyz
+                target_cart[3:6] += cartesian_delta[3:6]  # rpy
+                action_dict["cartesian_position"] = target_cart.tolist()
 
             # Use IK to get joint positions
             try:
-                target_joints = self._solve_cartesian_delta(cartesian_delta[:3], cartesian_delta[3:6])
+                if action_space == "target_cartesian":
+                    target_joints = self._solve_cartesian_target(cart_action)
+                else:
+                    target_joints = self._solve_cartesian_delta(
+                        cartesian_delta[:3],
+                        cartesian_delta[3:6],
+                    )
                 action_dict["joint_position"] = target_joints.tolist()
                 joint_delta = target_joints - current_joint_pos
                 action_dict["joint_velocity"] = (joint_delta / dt).tolist()

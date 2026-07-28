@@ -28,6 +28,9 @@ _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 
 clip_physical_cartesian_delta = _MODULE.clip_physical_cartesian_delta
+absolute_cartesian_target_to_delta = (
+    _MODULE.absolute_cartesian_target_to_delta
+)
 normalized_cartesian_velocity_to_delta = (
     _MODULE.normalized_cartesian_velocity_to_delta
 )
@@ -105,6 +108,58 @@ class LegacyCartesianVelocityTests(unittest.TestCase):
 
         np.testing.assert_allclose(result[:3], [0.06, 0.08, 0.0])
         np.testing.assert_allclose(result[3:6], [0.0, 0.0, 0.2])
+
+
+class AbsoluteCartesianTargetTests(unittest.TestCase):
+    def test_target_is_recomputed_from_current_pose(self) -> None:
+        target = np.array([0.50, 0.10, 0.30, 0.0, 0.0, 0.0])
+        first_current = np.array([0.45, 0.10, 0.30, 0.0, 0.0, 0.0])
+        later_current = np.array([0.48, 0.10, 0.30, 0.0, 0.0, 0.0])
+
+        first_delta = absolute_cartesian_target_to_delta(
+            target, first_current, 0.1, 0.3
+        )
+        later_delta = absolute_cartesian_target_to_delta(
+            target, later_current, 0.1, 0.3
+        )
+
+        np.testing.assert_allclose(first_delta[:3], [0.05, 0.0, 0.0])
+        np.testing.assert_allclose(later_delta[:3], [0.02, 0.0, 0.0])
+
+    def test_unclipped_rotation_delta_reconstructs_target(self) -> None:
+        current = np.array([0.0, 0.0, 0.0, 0.2, -0.1, 0.3])
+        target = np.array([0.0, 0.0, 0.0, -0.4, 0.25, -0.2])
+
+        delta = absolute_cartesian_target_to_delta(
+            target, current, 1.0, np.pi
+        )
+
+        reconstructed = (
+            _MODULE.R.from_euler("xyz", delta[3:6])
+            * _MODULE.R.from_euler("xyz", current[3:6])
+        )
+        expected = _MODULE.R.from_euler("xyz", target[3:6])
+        np.testing.assert_allclose(
+            (reconstructed * expected.inv()).as_rotvec(),
+            np.zeros(3),
+            atol=1e-12,
+        )
+
+    def test_translation_and_physical_rotation_are_bounded(self) -> None:
+        current = np.zeros(6)
+        target = np.array([3.0, 4.0, 0.0, 0.0, 0.0, 1.0])
+
+        delta = absolute_cartesian_target_to_delta(
+            target, current, 0.1, 0.2
+        )
+
+        np.testing.assert_allclose(delta[:3], [0.06, 0.08, 0.0])
+        self.assertAlmostEqual(
+            np.linalg.norm(
+                _MODULE.R.from_euler("xyz", delta[3:6]).as_rotvec()
+            ),
+            0.2,
+        )
 
 
 if __name__ == "__main__":

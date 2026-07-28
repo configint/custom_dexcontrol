@@ -142,6 +142,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             max_jerk=max_jerk,
             vel_ratio=vel_ratio,
             vel_damp_thresh=vel_damp_thresh,
+            max_linear_delta=self._max_lin_delta,
+            max_rotation_delta=self._max_rot_delta,
             head_init_pos=head_init_pos,
         )
         self._robot.launch_robot()
@@ -210,7 +212,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             ik_damping_arm_j3,
         )
         LOGGER.info(
-            "Cartesian limits: target_cartesian_delta=physical norm clip, "
+            "Cartesian limits: target_cartesian=absolute pose with fresh-state error, "
+            "target_cartesian_delta=physical norm clip, "
             "cartesian_velocity=legacy normalized scaling "
             "(max_lin_delta=%.6f m, max_rot_delta=%.6f rad)",
             self._max_lin_delta,
@@ -430,6 +433,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "joint_delta",
                 "cartesian_velocity",
                 "cartesian_delta",
+                "target_cartesian",
                 "target_cartesian_delta",
             ],
             metadata={
@@ -437,6 +441,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 "control_hz": str(self.control_hz),
                 "arm_side": self.arm_side,
                 "target_cartesian_delta_units": "xyz=m,rpy=rad",
+                "target_cartesian_units": "xyz=m,rpy=rad",
                 "max_linear_delta_m": str(self._max_lin_delta),
                 "max_rotation_delta_rad": str(self._max_rot_delta),
             },
@@ -518,10 +523,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # -- end gripper debug --
 
             t_step_start = time.time()
-            if self.R_world_to_robot is not None and (
-                "cartesian" in action_space or action_space == "target_cartesian_delta"
-            ):
-                action = self._transform_action_to_robot_frame(action)
+            if self.R_world_to_robot is not None:
+                if action_space == "target_cartesian":
+                    action = self._transform_target_to_robot_frame(action)
+                elif (
+                    "cartesian" in action_space
+                    or action_space == "target_cartesian_delta"
+                ):
+                    action = self._transform_action_to_robot_frame(action)
             if action_space == "cartesian_velocity":
                 raw_action = action.copy()
                 raw_lin_norm = float(np.linalg.norm(raw_action[:3]))
@@ -578,8 +587,13 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # (before any velocity->delta conversion) so the dict contains all
             # representations (cartesian_velocity, delta_action, joint_velocity, etc.)
             try:
+                action_for_info = (
+                    action
+                    if action_space == "target_cartesian"
+                    else np.asarray(request.action, dtype=np.float64)
+                )
                 action_dict = self._robot.create_action_dict(
-                    np.asarray(request.action, dtype=np.float64),
+                    action_for_info,
                     action_space=action_space,
                     gripper_action_space=gripper_action_space,
                     robot_state=pre_action_state,
@@ -933,6 +947,15 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         action = np.asarray(action, dtype=np.float64).copy()
         action[:3] = self.R_world_to_robot @ action[:3]
         action[3:6] = self.R_world_to_robot @ action[3:6]
+        return action
+
+    def _transform_target_to_robot_frame(self, action: np.ndarray) -> np.ndarray:
+        """Transform an absolute Cartesian pose from env frame to robot frame."""
+        action = np.asarray(action, dtype=np.float64).copy()
+        action[:3] = self.R_world_to_robot @ action[:3]
+        target_rotation = R.from_euler("xyz", action[3:6])
+        frame_rotation = R.from_matrix(self.R_world_to_robot)
+        action[3:6] = (frame_rotation * target_rotation).as_euler("xyz")
         return action
 
     def _transform_state_to_env_frame(self, state: np.ndarray) -> np.ndarray:

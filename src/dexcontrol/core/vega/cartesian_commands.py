@@ -11,6 +11,7 @@ is therefore scaled to the same per-step limits on every command.
 from __future__ import annotations
 
 import numpy as np
+from scipy.spatial.transform import Rotation as R
 
 
 def _validate_limit(name: str, value: float) -> float:
@@ -73,3 +74,41 @@ def normalized_cartesian_velocity_to_delta(
     converted[:3] = linear * linear_limit
     converted[3:6] = rotation * rotation_limit
     return converted
+
+
+def absolute_cartesian_target_to_delta(
+    target_pose: np.ndarray,
+    current_pose: np.ndarray,
+    max_linear_delta: float,
+    max_rotation_delta: float,
+) -> np.ndarray:
+    """Convert an absolute Cartesian target into a bounded world-frame delta.
+
+    Both poses use ``[x, y, z, roll, pitch, yaw]`` in metres/radians.  The
+    returned rotation is an XYZ Euler delta whose left-multiplication onto the
+    current orientation reaches the target orientation.  Rotation clipping is
+    performed on the relative rotation vector, so ``max_rotation_delta`` is a
+    physical angle bound rather than an Euler-component approximation.
+    """
+    linear_limit = _validate_limit("max_linear_delta", max_linear_delta)
+    rotation_limit = _validate_limit("max_rotation_delta", max_rotation_delta)
+
+    target = np.asarray(target_pose, dtype=np.float64)
+    current = np.asarray(current_pose, dtype=np.float64)
+    if target.shape != (6,) or current.shape != (6,):
+        raise ValueError(
+            "target_pose and current_pose must each have shape (6,)"
+        )
+
+    delta_xyz = _clip_vector_norm(target[:3] - current[:3], linear_limit)
+
+    target_rotation = R.from_euler("xyz", target[3:6])
+    current_rotation = R.from_euler("xyz", current[3:6])
+    relative_rotation = target_rotation * current_rotation.inv()
+    delta_rotvec = _clip_vector_norm(
+        relative_rotation.as_rotvec(),
+        rotation_limit,
+    )
+    delta_rpy = R.from_rotvec(delta_rotvec).as_euler("xyz")
+
+    return np.concatenate([delta_xyz, delta_rpy]).astype(np.float64)
