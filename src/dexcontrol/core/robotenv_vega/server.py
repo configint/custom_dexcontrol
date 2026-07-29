@@ -27,6 +27,7 @@ sys.path.insert(0, str(_this.parents[4]))  # <repo>/          -> "from proto..."
 from core.vega.cartesian_commands import (  # noqa: E402
     clip_physical_cartesian_delta,
     normalized_cartesian_velocity_to_delta,
+    rebase_physical_cartesian_delta,
 )
 from core.vega.robot import (  # noqa: E402
     CommunicationFailedError,
@@ -180,6 +181,9 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         self._cmd_lock = threading.Lock()
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
+        # Robot-frame Cartesian pose included in the most recent Reset/Step
+        # response. target_cartesian_delta is defined relative to this pose.
+        self._last_observation_cartesian_pose: Optional[np.ndarray] = None
 
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
@@ -456,6 +460,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
 
         with self._cmd_lock:
             self._cancel_move.clear()
+            self._last_observation_cartesian_pose = None
             try:
                 if mode == "home":
                     target_joints = self.reset_joints
@@ -533,25 +538,37 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     raw_lin_norm, raw_rot_norm, self._max_lin_delta, self._max_rot_delta,
                 )
             elif action_space == "target_cartesian_delta":
-                # The Oculus controller emits a physical TCP/wrist pose error:
-                # metres for xyz and radians for RPY. Preserve small errors and
-                # only norm-clip commands that exceed the per-step safety caps.
-                raw_action = action.copy()
-                action = self._clip_target_cartesian_delta(action)
+                # Keep the complete physical pose error until the observation
+                # reference has been moved to the latest robot pose. The
+                # per-step safety clip applies to the final executed delta.
                 action_space_for_robot = "cartesian_delta"
-                if not np.allclose(raw_action[:6], action[:6]):
-                    LOGGER.debug(
-                        "Clipped target_cartesian_delta: linear %.6f->%.6f m, "
-                        "rotation %.6f->%.6f rad",
-                        float(np.linalg.norm(raw_action[:3])),
-                        float(np.linalg.norm(action[:3])),
-                        float(np.linalg.norm(raw_action[3:6])),
-                        float(np.linalg.norm(action[3:6])),
-                    )
             t_after_xform = time.time()
 
             # Get robot_state BEFORE executing action (needed for create_action_dict)
             pre_action_state, _ = self._robot.get_robot_state()
+            if action_space == "target_cartesian_delta":
+                requested_action = action.copy()
+                if self._last_observation_cartesian_pose is None:
+                    # A client can call Step before Reset has returned an
+                    # observation. Preserve the previous direct-delta behavior
+                    # until a response pose is available as the reference.
+                    action = self._clip_target_cartesian_delta(action)
+                else:
+                    action = rebase_physical_cartesian_delta(
+                        action,
+                        reference_pose=self._last_observation_cartesian_pose,
+                        current_pose=np.asarray(
+                            pre_action_state["cartesian_position"],
+                            dtype=np.float64,
+                        ),
+                        max_linear_delta=self._max_lin_delta,
+                        max_rotation_delta=self._max_rot_delta,
+                    )
+                LOGGER.debug(
+                    "Rebased target_cartesian_delta: requested=%s executed=%s",
+                    np.round(requested_action[:6], 6).tolist(),
+                    np.round(action[:6], 6).tolist(),
+                )
             LOGGER.debug(
                 "[CartesianPos] %s",
                 np.round(np.asarray(pre_action_state["cartesian_position"], dtype=np.float64), 4).tolist(),
@@ -717,7 +734,11 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         state_dict, timestamp_dict = self._robot.get_robot_state()
         timestamp_us = self._timestamp_us(timestamp_dict)
 
-        cartesian_position = np.asarray(state_dict["cartesian_position"], dtype=np.float64)
+        cartesian_position = np.asarray(
+            state_dict["cartesian_position"],
+            dtype=np.float64,
+        )
+        self._last_observation_cartesian_pose = cartesian_position.copy()
         if self.R_robot_to_world is not None:
             cartesian_position = self._transform_state_to_env_frame(cartesian_position)
 

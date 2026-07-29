@@ -31,6 +31,7 @@ clip_physical_cartesian_delta = _MODULE.clip_physical_cartesian_delta
 normalized_cartesian_velocity_to_delta = (
     _MODULE.normalized_cartesian_velocity_to_delta
 )
+rebase_physical_cartesian_delta = _MODULE.rebase_physical_cartesian_delta
 
 
 class PhysicalCartesianDeltaTests(unittest.TestCase):
@@ -105,6 +106,72 @@ class LegacyCartesianVelocityTests(unittest.TestCase):
 
         np.testing.assert_allclose(result[:3], [0.06, 0.08, 0.0])
         np.testing.assert_allclose(result[3:6], [0.0, 0.0, 0.2])
+
+
+class RebasePhysicalCartesianDeltaTests(unittest.TestCase):
+    def test_unchanged_pose_preserves_command(self) -> None:
+        command = np.array([0.03, -0.01, 0.02, 0.0, 0.0, 0.1, 0.7])
+        pose = np.array([0.4, 0.2, 0.3, 0.1, -0.2, 0.3])
+
+        result = rebase_physical_cartesian_delta(
+            command,
+            reference_pose=pose,
+            current_pose=pose,
+            max_linear_delta=0.1,
+            max_rotation_delta=0.2,
+        )
+
+        np.testing.assert_allclose(result, command, atol=1e-12)
+
+    def test_robot_motion_is_removed_from_requested_delta(self) -> None:
+        command = np.array([0.08, 0.0, 0.0, 0.0, 0.0, 0.2, 0.4])
+        reference = np.zeros(6)
+        current = np.array([0.03, 0.0, 0.0, 0.0, 0.0, 0.05])
+
+        result = rebase_physical_cartesian_delta(
+            command,
+            reference_pose=reference,
+            current_pose=current,
+            max_linear_delta=0.1,
+            max_rotation_delta=0.3,
+        )
+
+        np.testing.assert_allclose(result[:3], [0.05, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(result[3:6], [0.0, 0.0, 0.15], atol=1e-12)
+        self.assertEqual(result[6], command[6])
+
+    def test_rebased_command_is_clipped_to_physical_limits(self) -> None:
+        command = np.array([0.08, 0.0, 0.0, 0.0, 0.0, 0.2])
+        reference = np.zeros(6)
+        current = np.array([-0.08, 0.0, 0.0, 0.0, 0.0, -0.2])
+
+        result = rebase_physical_cartesian_delta(
+            command,
+            reference_pose=reference,
+            current_pose=current,
+            max_linear_delta=0.1,
+            max_rotation_delta=0.3,
+        )
+
+        np.testing.assert_allclose(result[:3], [0.1, 0.0, 0.0], atol=1e-12)
+        np.testing.assert_allclose(result[3:6], [0.0, 0.0, 0.3], atol=1e-12)
+
+    def test_requested_error_is_not_clipped_before_rebasing(self) -> None:
+        command = np.array([0.2, 0.0, 0.0, 0.0, 0.0, 0.0])
+        reference = np.zeros(6)
+        current = np.array([0.05, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+        result = rebase_physical_cartesian_delta(
+            command,
+            reference_pose=reference,
+            current_pose=current,
+            max_linear_delta=0.1,
+            max_rotation_delta=0.3,
+        )
+
+        # Goal is reference + 0.2, so the current-to-goal error is 0.15 and
+        # only that final executed error is clipped to 0.1.
+        np.testing.assert_allclose(result[:3], [0.1, 0.0, 0.0], atol=1e-12)
 
 
 if __name__ == "__main__":
