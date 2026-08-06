@@ -176,6 +176,12 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         # Set by a new Reset to cancel any in-progress _move_incremental loop.
         self._cancel_move = threading.Event()
 
+        # Timestamp of the most recent Step() call, used to compute the
+        # actual RPC interval for gripper velocity → position conversion.
+        self._last_step_time: float | None = None
+        # Cap on dt to avoid large gripper jumps after network hiccups.
+        self._gripper_dt_cap: float = 0.15
+
         LOGGER.info(
             "Initialized VegaRobotEnvService model=%s arm=%s gripper=%s frame=%s hz=%s",
             robot_model,
@@ -504,6 +510,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             # -- end gripper debug --
 
             t_step_start = time.time()
+
+
             if self.R_world_to_robot is not None and (
                 "cartesian" in action_space or action_space == "target_cartesian_delta"
             ):
