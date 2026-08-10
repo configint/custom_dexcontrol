@@ -115,7 +115,21 @@ _GLOVE_POOL_ROWS = 5
 _GLOVE_POOL_COLS = 8
 
 # Serial-number handedness convention (4th char): J = left, K = right.
+# This is the Wuji Hand 2 FIRMWARE convention, and the only thing the SDK's own
+# `SdkManager.connect(handedness=...)` goes by — its Handedness docstring says
+# devices whose SN does not follow it "will be filtered out at discovery". Our
+# v1 hands ship plain STM32-UID serials (e.g. "367A39773134"), so connect-by-
+# handedness cannot see them at all: v1 must be selected by SN and verified
+# after connect via handedness_name() (the handedness SDO, 0=Right / 1=Left).
 _SN_HANDEDNESS = {"J": "left", "K": "right"}
+
+# Per-unit hand map: {"left": "<sn>", "right": "<sn>"}. Unit-specific values
+# belong on the unit, never in the repo or a shared playbook, so the file lives
+# on the robot host and is written once by examples/wuji/identify_hands.py.
+# Override the location with WUJI_HAND_MAP.
+_HAND_MAP_PATH = os.environ.get(
+    "WUJI_HAND_MAP", os.path.expanduser("~/.wuji/hands.json")
+)
 
 # Tactile availability by detected hand model — the source of truth for
 # whether a tactile stream is expected on this end-effector. Current wuji
@@ -142,6 +156,32 @@ def _sn_handedness(sn: str) -> str | None:
     if len(sn) >= 4:
         return _SN_HANDEDNESS.get(sn[3].upper())
     return None
+
+
+def _sn_from_hand_map(handedness: str) -> str | None:
+    """Serial number pinned for this handedness on this unit, if configured.
+
+    A missing file is normal (auto-selection still works). A malformed one is
+    not: silently ignoring it would bind an arm to whichever hand answered
+    first, which is the left/right swap this file exists to prevent.
+    """
+    try:
+        with open(_HAND_MAP_PATH) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as e:
+        raise RuntimeError(f"Cannot read Wuji hand map {_HAND_MAP_PATH}: {e}") from e
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Wuji hand map {_HAND_MAP_PATH} must be a JSON object")
+    sn = data.get(handedness)
+    if sn is None:
+        return None
+    if not isinstance(sn, str) or not sn:
+        raise RuntimeError(
+            f"Wuji hand map {_HAND_MAP_PATH}: {handedness!r} must be a non-empty string"
+        )
+    return sn
 
 
 class WujiHandAdapter:
@@ -291,7 +331,18 @@ class WujiHandAdapter:
     # ------------------------------------------------------------------
 
     def _connect(self, sn: str | None, init_timeout: float):
-        """Scan and connect the requested hand device."""
+        """Scan and connect the requested hand device.
+
+        Selection order: explicit sn > per-unit hand map (~/.wuji/hands.json) >
+        SN handedness convention > any hand whose reported handedness matches.
+        """
+        if sn is None:
+            sn = _sn_from_hand_map(self._handedness)
+            if sn is not None:
+                logger.info(
+                    "Wuji hand ({}): using sn={} from {}.",
+                    self._handedness, sn, _HAND_MAP_PATH,
+                )
         deadline = time.monotonic() + init_timeout
         hand_types = (DeviceType.WujiHand, DeviceType.WujiHand2)
         while True:
@@ -312,9 +363,32 @@ class WujiHandAdapter:
                     hand = self._manager.connect(
                         sn=dev.sn, device_name=f"wuji_hand_{self._handedness}"
                     )
+                    # handedness_name() decodes the handedness SDO after
+                    # connect (0=Right / 1=Left) and is the authority here.
                     reported = getattr(hand, "handedness_name", lambda: None)()
-                    if reported is None or str(reported).lower() == self._handedness:
+                    normalized = str(reported).lower() if reported is not None else ""
+                    if normalized == self._handedness:
                         return hand
+                    if normalized in ("", "unknown"):
+                        # The hand cannot say which side it is. With a single
+                        # hand attached there is nothing to confuse it with, so
+                        # take it; with several, guessing risks driving the arm
+                        # with the wrong hand — demand an explicit mapping.
+                        if len(devices) == 1:
+                            logger.warning(
+                                "Wuji hand sn={} reports handedness {!r}; accepting it "
+                                "as the {} hand because it is the only one attached.",
+                                dev.sn, reported, self._handedness,
+                            )
+                            return hand
+                        self._manager.disconnect_all()
+                        raise ConnectionError(
+                            f"Wuji hand sn={dev.sn} reports handedness {reported!r} and "
+                            f"{len(devices)} hands are attached, so the {self._handedness} "
+                            f"hand cannot be identified. Record the mapping once with "
+                            f"`python examples/wuji/identify_hands.py` (writes "
+                            f"{_HAND_MAP_PATH}), or pass an explicit --wuji-sn."
+                        )
                     logger.warning(
                         "Wuji hand sn={} reports handedness {!r}, want {!r}; skipping.",
                         dev.sn, reported, self._handedness,
@@ -744,6 +818,20 @@ class WujiHandAdapter:
     def model(self) -> str:
         """Detected hand model: 'wuji_hand_v1' (gen 1) or 'wuji_hand_v2' (gen 2)."""
         return "wuji_hand_v2" if self._is_hand2 else "wuji_hand_v1"
+
+    @property
+    def reported_handedness(self) -> str | None:
+        """Side this hand reports for itself: 'left' | 'right' | None.
+
+        Decodes the device handedness SDO (firmware encoding 0=Right / 1=Left).
+        None when the firmware answers "Unknown" or does not expose it — the
+        case identify_hands.py falls back to asking the operator about.
+        """
+        name = getattr(self._hand, "handedness_name", lambda: None)()
+        if name is None:
+            return None
+        side = str(name).lower()
+        return side if side in ("left", "right") else None
 
     @property
     def has_tactile(self) -> bool:

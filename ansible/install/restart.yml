@@ -15,6 +15,20 @@
     #   "vega_hand"  -> integrated F5D6 5-finger hand (no port flag)
     # Override with `-e gripper_type=wuji_hand_v1` on the ansible-playbook CLI.
     gripper_type: "robotiq"
+    # Wuji hand serial numbers are PER UNIT, so they are not stored here.
+    # Each robot host keeps its own map at ~/.wuji/hands.json, written once by
+    # `python examples/wuji/identify_hands.py` — WujiHandAdapter reads it and
+    # binds each arm to the right hand. Needed because shipped serials (plain
+    # STM32 UIDs, e.g. 367A39773134) carry no handedness.
+    # These stay empty; use `-e wuji_right_sn=...` only for a one-off override.
+    wuji_left_sn: ""
+    wuji_right_sn: ""
+    # Try identify_hands.py --auto (reads the handedness the SDK reports; no
+    # motion) when the host has no map yet. Set false to always identify by hand.
+    wuji_auto_identify: true
+    # Abort the deploy when the map is still incomplete. Set false for a
+    # single-hand bring-up, where auto-selection is unambiguous.
+    wuji_require_hand_map: true
 
   tasks:
     # ── Pre-flight checks ────────────────────────────────────────────────────
@@ -161,6 +175,86 @@
       when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
       ignore_errors: "{{ gripper_type == 'vega_hand' }}"
 
+    # ── Wuji hand identity (per-unit left/right serial map) ─────────────────
+    # Serials carry no handedness on shipped units, so each host keeps its own
+    # ~/.wuji/hands.json. Deploy verifies it, tries a hands-off auto-identify
+    # (reads the handedness the SDK reports; commands no motion), and only then
+    # asks the operator to run the guided one-off. Without a map the servers
+    # still start — they just fall back to SDK auto-selection, which is why a
+    # 2-hand unit must not be left in that state.
+    - name: Check Wuji hand map on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'python3 - <<PY
+        import json, os
+        p = os.path.expanduser(os.environ.get("WUJI_HAND_MAP", "~/.wuji/hands.json"))
+        try:
+            d = json.load(open(p))
+        except Exception:
+            print("MISSING"); raise SystemExit(0)
+        have = [k for k in ("left", "right") if d.get(k)]
+        print("OK" if len(have) == 2 else "INCOMPLETE:" + ",".join(have))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_map_check
+      become: false
+      changed_when: false
+      when: gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+
+    - name: Auto-identify Wuji hands from SDK-reported handedness (best effort)
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot &&
+           python ~/custom_dexcontrol/examples/wuji/identify_hands.py --auto'
+      args:
+        executable: /bin/bash
+      register: wuji_auto_identify_run
+      become: false
+      ignore_errors: true
+      when:
+        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - wuji_auto_identify | bool
+        - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
+
+    - name: Re-check Wuji hand map after auto-identify
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'python3 - <<PY
+        import json, os
+        p = os.path.expanduser(os.environ.get("WUJI_HAND_MAP", "~/.wuji/hands.json"))
+        try:
+            d = json.load(open(p))
+        except Exception:
+            print("MISSING"); raise SystemExit(0)
+        have = [k for k in ("left", "right") if d.get(k)]
+        print("OK" if len(have) == 2 else "INCOMPLETE:" + ",".join(have))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_map_recheck
+      become: false
+      changed_when: false
+      when:
+        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - wuji_map_check.stdout is defined and wuji_map_check.stdout != "OK"
+
+    - name: Fail with hand-identification instructions when the map is still incomplete
+      fail:
+        msg: >-
+          Wuji hand map ({{ wuji_map_recheck.stdout }}) — this unit does not know
+          which serial is the left hand and which is the right, and its serials do
+          not encode handedness. Run ONCE on dexmate (interactive; each hand wiggles
+          and you answer which one moved):
+          conda activate robot &&
+          python ~/custom_dexcontrol/examples/wuji/identify_hands.py
+          Then rerun this playbook. Inspect the result with the same script and --show.
+          To proceed anyway on a single-hand bring-up, pass -e wuji_require_hand_map=false
+      when:
+        - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
+        - wuji_require_hand_map | bool
+        - wuji_map_recheck.stdout is defined and wuji_map_recheck.stdout != "OK"
+
     - name: Display gripper port assignments
       debug:
         msg: "[{{ gripper_type }}] Left: {{ left_gripper_port }} / Right: {{ right_gripper_port }}"
@@ -187,6 +281,17 @@
              else '--gripper-iface' if gripper_type == 'sr_gripper'
              else '--robotiq-comport' }}
 
+    # Only wuji hands take an SN; robotiq/sr/vega_hand get an empty string so
+    # the command line is unchanged for them.
+    - name: Resolve per-arm wuji SN flags
+      set_fact:
+        left_wuji_sn_flag: >-
+          {{ ('--wuji-sn ' ~ wuji_left_sn)
+             if (gripper_type in ['wuji_hand_v1', 'wuji_hand_v2'] and wuji_left_sn) else '' }}
+        right_wuji_sn_flag: >-
+          {{ ('--wuji-sn ' ~ wuji_right_sn)
+             if (gripper_type in ['wuji_hand_v1', 'wuji_hand_v2'] and wuji_right_sn) else '' }}
+
     - name: Start robot-server tmux session on dexmate (left + right arm)
       shell: |
         sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
@@ -196,6 +301,7 @@
             --grpc-port 50061 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ left_gripper_port }} \
+            {{ left_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \
@@ -214,6 +320,7 @@
             --grpc-port 50063 \
             --gripper-type {{ gripper_type }} \
             {{ gripper_port_flag }} {{ right_gripper_port }} \
+            {{ right_wuji_sn_flag }} \
             --use-velocity-feedforward \
             --interpolation-method linear \
             --interpolation-history 3 \
