@@ -107,6 +107,16 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
         if hand_type is not None and gripper_type == "default":
             gripper_type = hand_type
 
+        # The F5D6 5-finger hand is an integrated robot component (left_hand/
+        # right_hand) that only exists in the *_f5d6 robot config. Robotiq/SR/
+        # Wuji grippers are separate hardware and use the base vega_1 config.
+        # So when the hand is vega_hand, ensure robot_model carries the f5d6
+        # variant — otherwise has_component('left_hand') is False, the hand is
+        # never wired up, and the hand DoF collapses to 1.
+        if gripper_type == "vega_hand" and "f5d6" not in robot_model:
+            robot_model = f"{robot_model}_f5d6"
+            LOGGER.info("[ModelResolve] gripper_type=vega_hand -> robot_model=%s", robot_model)
+
         self.robot_model = robot_model
         self.arm_side = arm_side
         self.gripper_type = gripper_type
@@ -422,8 +432,8 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
             )
         )
         # Tactile: declared only when the hand actually streams it, with the
-        # runtime-detected size (wuji_hand_2 fingertip aggregate = 15,
-        # wuji_hand tactile glove pooled = 40, F5D6_V2 fingertip force = 5).
+        # runtime-detected size (wuji_hand_v2 fingertip aggregate = 15,
+        # wuji_hand_v1 tactile glove pooled = 40, F5D6_V2 fingertip force = 5).
         # Scalar-gripper specs are unchanged.
         _tactile = None
         if hasattr(self._robot.hand, "get_hand_tactile"):
@@ -432,9 +442,14 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                 # Stream wired up but no frame yet — report the pinned
                 # per-model size instead of dropping the field.
                 _tactile = np.zeros(
-                    15 if getattr(self._robot.hand, "model", "") == "wuji_hand_2" else 40
+                    15 if getattr(self._robot.hand, "model", "") == "wuji_hand_v2" else 40
                 )
-        elif self.gripper_type == "vega_hand":
+        elif self.gripper_type == "vega_hand" and hasattr(
+            self._robot.hand, "get_finger_tip_force"
+        ):
+            # dexbot F5D6_V2 fingertip force. Gated on the accessor existing:
+            # an F5D6 V1 has no tactile at all, and advertising a field the
+            # observation never carries makes the spec lie to the client.
             _tactile = np.zeros(5)
         if _tactile is not None:
             spec.fields["hand_tactile"].CopyFrom(
@@ -445,7 +460,7 @@ class VegaRobotEnvService(robotenv_pb2_grpc.RobotEnvServicer):
                     description="Hand tactile vector (per-model layout)",
                 )
             )
-        # Report the auto-detected hand model (wuji_hand vs wuji_hand_2) for
+        # Report the auto-detected hand model (wuji_hand_v1 vs wuji_hand_v2) for
         # logging/debug; absent for non-wuji end-effectors.
         _model = getattr(self._robot.hand, "model", None)
         if _model is not None:
@@ -1190,7 +1205,7 @@ def main() -> None:
         "--wuji-sn",
         type=str,
         default=None,
-        help="Wuji hand serial number when --gripper-type=wuji_hand. Defaults to "
+        help="Wuji hand serial number when --gripper-type=wuji_hand_v1/v2. Defaults to "
              "auto-selection by handedness (SN 4th char J=left/K=right).",
     )
     parser.add_argument(

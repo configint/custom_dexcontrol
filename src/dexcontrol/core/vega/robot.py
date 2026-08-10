@@ -152,6 +152,20 @@ class VegaRobot:
             raise TypeError(f"Unexpected keyword arguments: {unexpected}")
         if hand_type is not None and gripper_type == "default":
             gripper_type = hand_type
+        # Legacy 5-finger names, pre-v1/v2 rename. An unmigrated caller (saved
+        # shell history, an old unit row) must not fall through to the
+        # catch-all below: that starts a server which passes its health check
+        # while _hand_dof() collapses to 1 and every hand action is rejected.
+        _legacy_gripper_types = {"wuji_hand": "wuji_hand_v1",
+                                 "wuji_hand_2": "wuji_hand_v2"}
+        if gripper_type in _legacy_gripper_types:
+            _canonical = _legacy_gripper_types[gripper_type]
+            _logger.warning(
+                "gripper_type '%s' is a legacy name — using '%s'. Update the "
+                "caller/unit config to the canonical value.",
+                gripper_type, _canonical,
+            )
+            gripper_type = _canonical
         self._robotiq_comport = robotiq_comport
         self._ik_solver_type = ik_solver_type
 
@@ -186,7 +200,7 @@ class VegaRobot:
         elif gripper_type == "sr_gripper":
             from dexcontrol.core.sr_gripper import SrGripperAdapter  # lazy import
             self.hand = SrGripperAdapter(comport=self._robotiq_comport)
-        elif gripper_type in ("wuji_hand", "wuji_hand_2"):
+        elif gripper_type in ("wuji_hand_v1", "wuji_hand_v2"):
             from dexcontrol.core.wuji_hand import WujiHandAdapter  # lazy import
             self.hand = WujiHandAdapter(
                 handedness=arm_side,
@@ -539,7 +553,7 @@ class VegaRobot:
     # main: reclassifying the dexbot hand by its joint_name alone would change
     # its observation schema and add crash paths for deployments that never
     # opted in.
-    _MULTI_DOF_GRIPPER_TYPES = ("vega_hand", "wuji_hand", "wuji_hand_2")
+    _MULTI_DOF_GRIPPER_TYPES = ("vega_hand", "wuji_hand_v1", "wuji_hand_v2")
 
     def _hand_dof(self) -> int:
         """End-effector DoF: N for an opted-in multi-finger hand, else 1.
@@ -1482,7 +1496,7 @@ class VegaRobot:
             self._vel_log_file.close()
             self._vel_log_file = None
         self._stop_gripper_worker()
-        if self.gripper_type in ("robotiq", "sr_gripper", "wuji_hand", "wuji_hand_2") and self.hand is not None:
+        if self.gripper_type in ("robotiq", "sr_gripper", "wuji_hand_v1", "wuji_hand_v2") and self.hand is not None:
             try:
                 self.hand.shutdown()
             except Exception:

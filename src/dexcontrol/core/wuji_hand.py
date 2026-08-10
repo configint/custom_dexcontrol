@@ -28,15 +28,19 @@ the commanded target into the cache. A watchdog stops republishing
 commands when the state stream goes silent (USB unplug / link loss) and
 resumes when frames come back.
 
-Tactile: the receive path is always wired up (unless WUJI_TACTILE=off);
-the recorded `hand_tactile` schema is pinned per hand model:
-  - Wuji Hand 2: 15-vector — per-finger aggregate [fx, fy, fz] (newtons),
+Tactile availability is recorded PER MODEL in TACTILE_BY_MODEL — the current
+wuji v1/v2 units ship without tactile hardware (vendor-confirmed), so both
+map to False; flip the entry when a tactile-equipped unit arrives. Setting
+WUJI_TACTILE=on/off overrides the table (bench experiments). When enabled,
+the tactile stream MUST come up (device present + first frame within the
+init window) or construction fails loudly: a dataset must never be collected
+believing tactile is on while the column silently never arrives.
+Schema per hand model when enabled:
+  - Wuji Hand v2: 15-vector — per-finger aggregate [fx, fy, fz] (newtons),
     finger-major, decoded from the self-describing fingertip info contract.
-  - Wuji Hand (first gen, plug-in tactile glove): 40-vector — the pressure
-    frame mean-pooled to a fixed 5x8 grid (NaN-invalid cells excluded).
-    Raw frames additionally cached when WUJI_TACTILE_RAW=1.
-A hand without the tactile hardware simply reports None (key never set
-downstream).
+  - Wuji Hand v1 (plug-in tactile glove): 40-vector — the pressure frame
+    mean-pooled to a fixed 5x8 grid (NaN-invalid cells excluded). Raw frames
+    additionally cached when WUJI_TACTILE_RAW=1.
 
 Requirements:
     pip install wuji-sdk
@@ -113,6 +117,26 @@ _GLOVE_POOL_COLS = 8
 # Serial-number handedness convention (4th char): J = left, K = right.
 _SN_HANDEDNESS = {"J": "left", "K": "right"}
 
+# Tactile availability by detected hand model — the source of truth for
+# whether a tactile stream is expected on this end-effector. Current wuji
+# v1/v2 units ship WITHOUT tactile hardware (vendor-confirmed). Flip an entry
+# when a tactile-equipped unit arrives; WUJI_TACTILE=on/off overrides the
+# table without a code change. (vega_hand's dexbot fingertip force is a
+# separate always-on path in VegaRobot, not governed by this table.)
+TACTILE_BY_MODEL = {
+    "wuji_hand_v1": False,
+    "wuji_hand_v2": False,
+}
+
+# Accepted WUJI_TACTILE overrides. Anything else raises rather than being
+# read as "off" — see the resolution in __init__.
+_TACTILE_ENV_VALUES = {
+    "on": True, "1": True, "true": True, "yes": True, "y": True,
+    "enable": True, "enabled": True,
+    "off": False, "0": False, "false": False, "no": False, "n": False,
+    "disable": False, "disabled": False,
+}
+
 
 def _sn_handedness(sn: str) -> str | None:
     if len(sn) >= 4:
@@ -155,9 +179,6 @@ class WujiHandAdapter:
         if handedness not in ("left", "right"):
             raise ValueError(f"handedness must be 'left' or 'right', got {handedness!r}")
         self._handedness = handedness
-        self._tactile_enabled = os.environ.get("WUJI_TACTILE", "on").lower() not in (
-            "off", "0", "false",
-        )
         self._tactile_raw = os.environ.get("WUJI_TACTILE_RAW", "0").lower() in (
             "1", "on", "true",
         )
@@ -166,6 +187,24 @@ class WujiHandAdapter:
         self._manager = SdkManager.instance()
         self._hand = self._connect(sn, init_timeout)
         self._is_hand2 = isinstance(self._hand, WujiHand2)
+        # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
+        # after connect, once the model is known); WUJI_TACTILE=on/off is an
+        # explicit override. When enabled, a missing/dead tactile stream is a
+        # hard startup error (see _setup_tactile) — never a silent skip.
+        _tactile_env = os.environ.get("WUJI_TACTILE", "").strip().lower()
+        if _tactile_env in _TACTILE_ENV_VALUES:
+            self._tactile_enabled = _TACTILE_ENV_VALUES[_tactile_env]
+        elif _tactile_env:
+            # Never fall back to the table on an unrecognised value: silently
+            # reading "WUJI_TACTILE=yes" as OFF is exactly the "collected a
+            # dataset believing tactile was on" failure this design forbids.
+            raise ValueError(
+                f"WUJI_TACTILE={_tactile_env!r} is not a recognised value "
+                f"(use one of {sorted(_TACTILE_ENV_VALUES)}, or unset it to "
+                f"follow the per-model default)"
+            )
+        else:
+            self._tactile_enabled = TACTILE_BY_MODEL.get(self.model, False)
 
         # Everything below can touch live hardware; a failure part-way must
         # not leave motors enabled / channels open with no owner.
@@ -211,7 +250,23 @@ class WujiHandAdapter:
                 daemon=True,
             )
             self._worker.start()
+            # Tactile opted in → it must actually flow before we report ready.
+            if self._tactile_enabled:
+                self._wait_first_tactile_frame()
         except Exception:
+            # Stop the worker BEFORE tearing channels down. Once the worker is
+            # running (the tactile first-frame wait is the one failure that can
+            # happen after that), teardown nulls the very SDK handles it polls
+            # 100x/s, so a live worker would either flood NoneType errors that
+            # bury the real exception or race disable()/disconnect_all() inside
+            # the native SDK.
+            self._connected = False
+            _stop = getattr(self, "_stop_event", None)
+            if _stop is not None:
+                _stop.set()
+            _worker = getattr(self, "_worker", None)
+            if _worker is not None and _worker.is_alive():
+                _worker.join(timeout=2.0)
             self._teardown_channels()
             try:
                 self._hand.disable()
@@ -225,10 +280,10 @@ class WujiHandAdapter:
 
         logger.info(
             "Wuji {} ({}) ready: sn={}, tactile={}, async worker started.",
-            "Hand 2" if self._is_hand2 else "Hand",
+            "Hand v2" if self._is_hand2 else "Hand v1",
             handedness,
             self.serial_number,
-            "on" if (self._tactile_subs or self._glove_frame_sub) else "off",
+            "on" if self._tactile_enabled else "off",
         )
 
     # ------------------------------------------------------------------
@@ -349,58 +404,68 @@ class WujiHandAdapter:
         return _FALLBACK_LIMITS.copy()
 
     def _setup_tactile(self) -> None:
-        """Wire up the model's tactile stream; degrade to no-tactile on failure."""
-        try:
-            if self._is_hand2:
-                accessors = {
-                    "thumb": self._hand.fingertip_thumb_data,
-                    "index": self._hand.fingertip_index_data,
-                    "middle": self._hand.fingertip_middle_data,
-                    "ring": self._hand.fingertip_ring_data,
-                    "pinky": self._hand.fingertip_pinky_data,
-                }
-                for i, name in enumerate(_FINGERS):
-                    info = self._hand.get_fingertip_info(i)
-                    fmt = json.loads(info.format)
-                    if fmt["v"] != 1 or fmt["encoding"] != "point_array":
-                        raise ValueError(f"unsupported fingertip format: {fmt.get('encoding')}")
-                    self._tactile_decoders[name] = self._make_aggregate_decoder(fmt)
-                    self._tactile_subs[name] = accessors[name]().subscribe()
-            else:
-                # First-gen tactile glove pairs at connect time only; a short
-                # status poll tells whether one is attached.
-                status_sub = self._hand.tactile_status().subscribe()
-                attached = False
-                deadline = time.monotonic() + 1.0
-                try:
-                    while time.monotonic() < deadline:
-                        status = status_sub.recv()
-                        if status is not None:
-                            attached = status.state == 1
-                            break
-                        time.sleep(0.02)
-                finally:
-                    status_sub.close()
-                if attached:
-                    self._glove_frame_sub = self._hand.tactile.subscribe_pressure_frame()
-                else:
-                    logger.info(
-                        "Wuji hand ({}): no tactile glove attached — "
-                        "hand_tactile disabled.", self._handedness,
+        """Wire up the model's tactile stream.
+
+        Only called when WUJI_TACTILE=on. Any failure — missing glove, absent
+        fingertip sensors, unsupported format — RAISES so the server refuses
+        to start: the operator asked for tactile data, so a session that
+        silently records none of it must not come up.
+        """
+        if self._is_hand2:
+            accessors = {
+                "thumb": self._hand.fingertip_thumb_data,
+                "index": self._hand.fingertip_index_data,
+                "middle": self._hand.fingertip_middle_data,
+                "ring": self._hand.fingertip_ring_data,
+                "pinky": self._hand.fingertip_pinky_data,
+            }
+            for i, name in enumerate(_FINGERS):
+                info = self._hand.get_fingertip_info(i)
+                fmt = json.loads(info.format)
+                if fmt["v"] != 1 or fmt["encoding"] != "point_array":
+                    raise RuntimeError(
+                        f"WUJI_TACTILE=on but finger '{name}' reports an "
+                        f"unsupported format: {fmt.get('encoding')!r}"
                     )
-        except Exception as e:
-            logger.warning(
-                "Wuji hand ({}): tactile setup failed ({}); continuing without "
-                "tactile.", self._handedness, e,
-            )
-            for sub in self._tactile_subs.values():
-                try:
-                    sub.close()
-                except Exception:
-                    pass
-            self._tactile_subs.clear()
-            self._tactile_decoders.clear()
-            self._glove_frame_sub = None
+                self._tactile_decoders[name] = self._make_aggregate_decoder(fmt)
+                self._tactile_subs[name] = accessors[name]().subscribe()
+        else:
+            # First-gen tactile glove pairs at connect time only; a short
+            # status poll tells whether one is attached.
+            status_sub = self._hand.tactile_status().subscribe()
+            attached = False
+            deadline = time.monotonic() + 1.0
+            try:
+                while time.monotonic() < deadline:
+                    status = status_sub.recv()
+                    if status is not None:
+                        attached = status.state == 1
+                        break
+                    time.sleep(0.02)
+            finally:
+                status_sub.close()
+            if not attached:
+                raise RuntimeError(
+                    "WUJI_TACTILE=on but no tactile glove is attached "
+                    "(plug it in before connecting, or set WUJI_TACTILE=off)"
+                )
+            self._glove_frame_sub = self._hand.tactile.subscribe_pressure_frame()
+
+    def _wait_first_tactile_frame(self, timeout: float = 3.0) -> None:
+        """Block until the tactile cache holds a real frame, or raise.
+
+        Guarantees that when tactile is enabled, hand_tactile is present from
+        the very first observation — the recorder's hand columns must be
+        complete in every row.
+        """
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if self.get_hand_tactile() is not None:
+                return
+            time.sleep(0.05)
+        raise RuntimeError(
+            f"WUJI_TACTILE=on but no tactile frame arrived within {timeout}s"
+        )
 
     @staticmethod
     def _make_aggregate_decoder(fmt: dict):
@@ -677,8 +742,8 @@ class WujiHandAdapter:
 
     @property
     def model(self) -> str:
-        """Detected hand model: 'wuji_hand' (first gen) or 'wuji_hand_2'."""
-        return "wuji_hand_2" if self._is_hand2 else "wuji_hand"
+        """Detected hand model: 'wuji_hand_v1' (gen 1) or 'wuji_hand_v2' (gen 2)."""
+        return "wuji_hand_v2" if self._is_hand2 else "wuji_hand_v1"
 
     @property
     def has_tactile(self) -> bool:

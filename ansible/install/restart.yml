@@ -9,10 +9,11 @@
     # Gripper selection:
     #   "robotiq"    -> 2-finger over ttyUSB
     #   "sr_gripper" -> 2-finger over EtherCAT
-    #   "wuji_hand"  -> Wuji 5-finger hand (USB for Hand 1 / Ethernet for
-    #                   Hand 2; the wuji-sdk driver auto-detects the model and
-    #                   picks each arm's hand by handedness, so no port flag)
-    # Override with `-e gripper_type=wuji_hand` on the ansible-playbook CLI.
+    #   "wuji_hand_v1" / "wuji_hand_v2" -> Wuji 5-finger hand (USB gen 1 /
+    #                   Ethernet gen 2; the wuji-sdk driver auto-detects the
+    #                   model and picks each arm's hand by handedness, no port)
+    #   "vega_hand"  -> integrated F5D6 5-finger hand (no port flag)
+    # Override with `-e gripper_type=wuji_hand_v1` on the ansible-playbook CLI.
     gripper_type: "robotiq"
 
   tasks:
@@ -104,14 +105,50 @@
         right_gripper_port: "{{ sr_iface_list.stdout_lines | last }}"
       when: gripper_type == "sr_gripper"
 
-    # wuji_hand has no serial/EtherCAT port — the wuji-sdk scans and selects
+    # No 5-finger hand has a serial/EtherCAT port — the wuji-sdk scans and selects
     # each arm's hand by handedness (or --wuji-sn). Provide empty defaults so
     # the start/debug tasks don't reference undefined vars.
-    - name: Default empty gripper ports for wuji_hand
+    - name: Default empty gripper ports for 5-finger hands (wuji/vega)
       set_fact:
         left_gripper_port: ""
         right_gripper_port: ""
-      when: gripper_type in ["wuji_hand", "wuji_hand_2"]
+      when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
+
+    # Installed for every 5-finger unit, vega_hand included: the hand on a
+    # unit can be swapped without a host visit, so the driver is pre-staged.
+    # Required only for wuji_hand_v1/v2 — for vega_hand it is a convenience,
+    # so a pip failure there must NOT abort the play before the servers are
+    # (re)started further down.
+    # The wuji hand v1 is a raw libusb device (VID 0483 / PID 2000, no tty).
+    # Its /dev/bus/usb node must be writable by the dexmate user or the SDK's
+    # scan() silently finds nothing. Installing the udev rule needs root —
+    # a ONE-TIME manual host setup — so this task only VERIFIES access and
+    # fails with the exact fix when it's missing (no sudo over ssh here: the
+    # dexmate account may not have passwordless sudo, and a password prompt
+    # inside a non-interactive ssh would hang the play).
+    - name: Verify wuji hand USB device is accessible on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} '
+          devs=$(lsusb -d 0483:2000 | sed "s#Bus \([0-9]*\) Device \([0-9]*\).*#/dev/bus/usb/\1/\2#")
+          if [ -z "$devs" ]; then echo NO_DEVICE; exit 0; fi
+          for d in $devs; do [ -w "$d" ] || { echo "NO_PERM $d"; exit 0; }; done
+          echo OK'
+      args:
+        executable: /bin/bash
+      register: wuji_usb_check
+      become: false
+      when: gripper_type == "wuji_hand_v1"
+
+    - name: Fail with udev fix instructions when the wuji hand is not accessible
+      fail:
+        msg: >-
+          Wuji hand USB check: {{ wuji_usb_check.stdout }}.
+          NO_DEVICE → plug the hand(s) into the dexmate machine.
+          NO_PERM → run ONCE on dexmate (needs root):
+          echo 'SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="2000", MODE="0666"'
+          | sudo tee /etc/udev/rules.d/99-wuji-hand.rules &&
+          sudo udevadm control --reload-rules && sudo udevadm trigger
+      when: gripper_type == "wuji_hand_v1" and wuji_usb_check.stdout is defined and wuji_usb_check.stdout != "OK"
 
     - name: Verify wuji-sdk is installed in the robot env on dexmate
       shell: |
@@ -121,7 +158,8 @@
       args:
         executable: /bin/bash
       become: false
-      when: gripper_type in ["wuji_hand", "wuji_hand_2"]
+      when: gripper_type in ["vega_hand", "wuji_hand_v1", "wuji_hand_v2"]
+      ignore_errors: "{{ gripper_type == 'vega_hand' }}"
 
     - name: Display gripper port assignments
       debug:
@@ -140,11 +178,12 @@
     # The gripper-port flag differs between gripper types:
     #   robotiq      -> --robotiq-comport <ttyUSB>
     #   sr_gripper   -> --gripper-iface   <EtherCAT iface>
-    #   wuji_hand    -> (no port flag; wuji-sdk selects by handedness/SN)
+    #   wuji_hand_v1/v2, vega_hand -> (no port flag; the driver selects by
+    #                   handedness/SN)
     - name: Resolve gripper-port CLI flag
       set_fact:
         gripper_port_flag: >-
-          {{ '' if gripper_type in ['wuji_hand', 'wuji_hand_2']
+          {{ '' if gripper_type in ['vega_hand', 'wuji_hand_v1', 'wuji_hand_v2']
              else '--gripper-iface' if gripper_type == 'sr_gripper'
              else '--robotiq-comport' }}
 
