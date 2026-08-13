@@ -13,8 +13,14 @@
     #                   Ethernet gen 2; the wuji-sdk driver auto-detects the
     #                   model and picks each arm's hand by handedness, no port)
     #   "vega_hand"  -> integrated F5D6 5-finger hand (no port flag)
-    # Override with `-e gripper_type=wuji_hand_v1` on the ansible-playbook CLI.
-    gripper_type: "robotiq"
+    #
+    # EMPTY (the default) resolves it from the unit's data-studio config —
+    # the same source RCI reads at connect — so the servers and the interface
+    # can never disagree just because a restart button was pressed without
+    # flags. `-e gripper_type=...` still overrides for one-offs; resolution
+    # failure is a hard error, never a silent robotiq fallback.
+    gripper_type: ""
+    unit_config_url: "http://data-studio-layout.tailb971f6.ts.net/api/unit_config"
     # Wuji hand serial numbers are PER UNIT, so they are not stored here.
     # Each robot host keeps its own map at ~/.wuji/hands.json, written once by
     # `python examples/wuji/identify_hands.py` — WujiHandAdapter reads it and
@@ -31,6 +37,55 @@
     wuji_require_hand_map: true
 
   tasks:
+    # ── Resolve gripper_type from the unit config ───────────────────────────
+    # Same endpoint and hostname RCI's setup pipeline uses
+    # (backend/setup_pipeline.py _fetch_unit_config), queried FROM the teleop
+    # host so reachability matches RCI's. Skipped entirely when
+    # `-e gripper_type=...` was given.
+    - name: Fetch unit config from data-studio
+      uri:
+        url: "{{ unit_config_url }}/{{ ansible_hostname }}"
+        return_content: true
+        timeout: 10
+      register: unit_cfg
+      become: false
+      failed_when: false
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Resolve gripper_type from unit config
+      vars:
+        _gripper_aliases:
+          robotiq: robotiq
+          robotiq_2f85: robotiq
+          robotiq_2f140: robotiq
+          sr_gripper: sr_gripper
+          sr_gripper_0.1: sr_gripper
+          vega_hand: vega_hand
+          wuji_hand_v1: wuji_hand_v1
+          wuji_hand_v2: wuji_hand_v2
+          wuji_hand: wuji_hand_v1
+          wuji_hand_2: wuji_hand_v2
+        _raw_gripper: "{{ (unit_cfg.json | default({})).gripper_type | default('') }}"
+      set_fact:
+        gripper_type: "{{ _gripper_aliases[_raw_gripper] | default('') }}"
+        gripper_type_source: "unit config (raw={{ _raw_gripper | default('') }})"
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Fail when gripper_type could not be resolved
+      fail:
+        msg: >-
+          Could not resolve gripper_type from the unit config
+          ({{ unit_config_url }}/{{ ansible_hostname }} returned
+          status={{ unit_cfg.status | default('unreachable') }},
+          gripper_type={{ (unit_cfg.json | default({})).gripper_type | default('missing') }}).
+          Fix the unit config in data-studio, or pass
+          -e gripper_type=<robotiq|sr_gripper|vega_hand|wuji_hand_v1|wuji_hand_v2>.
+      when: (gripper_type | default('')) | length == 0
+
+    - name: Display resolved gripper type
+      debug:
+        msg: "gripper_type = {{ gripper_type }} ({{ gripper_type_source | default('explicit -e override') }})"
+
     # ── Pre-flight checks ────────────────────────────────────────────────────
     - name: Install sshpass on teleop host
       apt:

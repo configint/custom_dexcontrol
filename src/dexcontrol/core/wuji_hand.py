@@ -360,9 +360,21 @@ class WujiHandAdapter:
                 if not candidates and devices:
                     candidates = devices
                 for dev in candidates:
-                    hand = self._manager.connect(
-                        sn=dev.sn, device_name=f"wuji_hand_{self._handedness}"
-                    )
+                    try:
+                        hand = self._manager.connect(
+                            sn=dev.sn, device_name=f"wuji_hand_{self._handedness}"
+                        )
+                    except Exception as e:
+                        # Auto-selection has to open a hand to ask which side it
+                        # is, so with both arm servers starting at once each can
+                        # be probing the other's hand when it claims the USB
+                        # device. That is transient: skip this candidate and let
+                        # the retry loop pick it up once the owner settles.
+                        logger.warning(
+                            "Wuji hand sn={} could not be opened while looking for the "
+                            "{} hand ({}); retrying.", dev.sn, self._handedness, e,
+                        )
+                        continue
                     # handedness_name() decodes the handedness SDO after
                     # connect (0=Right / 1=Left) and is the authority here.
                     reported = getattr(hand, "handedness_name", lambda: None)()
