@@ -436,7 +436,10 @@ class WujiHandAdapter:
                         )
                         continue
                     # handedness_name() decodes the handedness SDO after
-                    # connect (0=Right / 1=Left) and is the authority here.
+                    # connect (0=Right / 1=Left) and is the authority WHEN the
+                    # device answers. Hand 2 does not implement it — its side
+                    # lives in the SN convention instead (the same convention
+                    # the SDK's own connect-by-handedness filters by).
                     reported = getattr(hand, "handedness_name", lambda: None)()
                     normalized = str(reported).lower() if reported is not None else ""
                     if normalized == self._handedness:
@@ -445,10 +448,24 @@ class WujiHandAdapter:
                         _update_hand_map(self._handedness, dev.sn)
                         return hand
                     if normalized in ("", "unknown"):
-                        # The hand cannot say which side it is. With a single
-                        # hand attached there is nothing to confuse it with, so
-                        # take it; with several, guessing risks driving the arm
-                        # with the wrong hand — demand an explicit mapping.
+                        if _sn_handedness(dev.sn) == self._handedness:
+                            # No device report, but the SN convention already
+                            # identifies the side (Hand 2). The convention is
+                            # firmware-assigned, so this is a verified match,
+                            # not a guess — accept and pin it.
+                            logger.info(
+                                "Wuji hand sn={} does not report handedness; "
+                                "accepting it as the {} hand per the SN "
+                                "convention (4th char J=left/K=right).",
+                                dev.sn, self._handedness,
+                            )
+                            _update_hand_map(self._handedness, dev.sn)
+                            return hand
+                        # The hand cannot say which side it is and its SN
+                        # carries no side either. With a single hand attached
+                        # there is nothing to confuse it with, so take it;
+                        # with several, guessing risks driving the arm with
+                        # the wrong hand — demand an explicit mapping.
                         if len(devices) == 1:
                             logger.warning(
                                 "Wuji hand sn={} reports handedness {!r}; accepting it "
