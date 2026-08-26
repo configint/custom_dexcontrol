@@ -207,6 +207,18 @@ class VegaRobot:
                 sn=wuji_sn,
                 effort_limit=wuji_effort_limit,
             )
+            # The adapter connects whichever wuji generation is attached, but
+            # RCI builds its finger retargeter from the CONFIGURED type — a
+            # generation mismatch runs without any error while every finger
+            # command uses the wrong kinematics, and recordings claim the
+            # wrong hand. Refuse to start instead.
+            if self.hand.model != gripper_type:
+                raise RuntimeError(
+                    f"Unit config says gripper_type={gripper_type!r} but the "
+                    f"attached hand is a {self.hand.model!r} "
+                    f"(sn={self.hand.serial_number}). Fix the unit config in "
+                    f"data-studio or attach the matching hand, then restart."
+                )
         else:
             self.hand = getattr(self.robot, hand_component) if self.robot.has_component(hand_component) else None
 

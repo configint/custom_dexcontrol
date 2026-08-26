@@ -97,11 +97,13 @@ def main() -> int:
               f"less accurate. Run scripts/rokoko_calibrate.py calibrate.")
     solver = HandSolver(is_right=(side == "right"),
                         calibration_offsets=calibration.get(side))
-    retargeter = make_retargeter(side, "wuji_hand_v1")
 
     hand = WujiHandAdapter(handedness=side, sn=args.sn,
                            effort_limit=args.effort_limit)
     print(f"Connected: model={hand.model} sn={hand.serial_number}")
+    # Retarget for the generation actually attached — a v1 retargeter driving
+    # a v2 hand is exactly the silent mismatch the server refuses to start on.
+    retargeter = make_retargeter(side, hand.model)
     print(f"Driving the {side} hand from the {side} glove for {args.duration:.0f}s. "
           f"Ctrl-C to stop.")
 

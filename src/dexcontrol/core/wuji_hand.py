@@ -184,6 +184,45 @@ def _sn_from_hand_map(handedness: str) -> str | None:
     return sn
 
 
+def _update_hand_map(handedness: str, sn: str) -> None:
+    """Record a VERIFIED handedness->sn binding (best effort).
+
+    Called only after the hand itself confirmed its side over the SDO, so a
+    stale map (old serials after a hand swap) heals itself on the first
+    successful start instead of paying the fallback grace forever. Never
+    called for the unverified single-hand acceptance. Both arm servers may
+    write concurrently — an exclusive flock serializes them.
+    """
+    import fcntl
+
+    path = os.path.expanduser(_HAND_MAP_PATH)
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            f.seek(0)
+            raw = f.read()
+            try:
+                data = json.loads(raw) if raw.strip() else {}
+            except ValueError:
+                data = {}
+            if not isinstance(data, dict):
+                data = {}
+            if data.get(handedness) == sn:
+                return
+            data[handedness] = sn
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        logger.info("Wuji hand map updated: {} -> sn={} ({}).",
+                    handedness, sn, path)
+    except OSError as e:
+        logger.warning("Could not update Wuji hand map {}: {}", path, e)
+
+
 class WujiHandAdapter:
     """Wuji Hand (1 or 2) controller compatible with the VegaRobot hand interface."""
 
@@ -335,15 +374,25 @@ class WujiHandAdapter:
 
         Selection order: explicit sn > per-unit hand map (~/.wuji/hands.json) >
         SN handedness convention > any hand whose reported handedness matches.
+        A stale map entry (serial no longer attached, e.g. after a hand swap)
+        falls back to auto-selection after a short grace window.
         """
+        sn_from_map = False
         if sn is None:
             sn = _sn_from_hand_map(self._handedness)
             if sn is not None:
+                sn_from_map = True
                 logger.info(
                     "Wuji hand ({}): using sn={} from {}.",
                     self._handedness, sn, _HAND_MAP_PATH,
                 )
         deadline = time.monotonic() + init_timeout
+        # A map entry is a hint, not a contract: after swapping hands (e.g.
+        # v1 -> v2) the file still names serials that no longer exist, and
+        # waiting for them would time the connect out. Give the mapped SN a
+        # grace window to enumerate, then fall back to auto-selection once
+        # OTHER hands are visible. An explicit --wuji-sn never falls back.
+        map_grace_deadline = time.monotonic() + min(5.0, init_timeout / 2)
         hand_types = (DeviceType.WujiHand, DeviceType.WujiHand2)
         while True:
             devices = [d for d in self._manager.scan() if d.device_type in hand_types]
@@ -353,6 +402,17 @@ class WujiHandAdapter:
                     return self._manager.connect(
                         sn=sn, device_name=f"wuji_hand_{self._handedness}"
                     )
+                if (sn_from_map and devices
+                        and time.monotonic() >= map_grace_deadline):
+                    logger.warning(
+                        "Wuji hand map sn={} is not among the attached hands "
+                        "{}; the map ({}) looks stale — falling back to "
+                        "auto-selection. Refresh it with "
+                        "`python examples/wuji/identify_hands.py --auto`.",
+                        sn, [d.sn for d in devices], _HAND_MAP_PATH,
+                    )
+                    sn = None
+                    continue
             else:
                 # Prefer the SN handedness convention (4th char J=left/K=right);
                 # verify after connect when the SDK reports handedness.
@@ -380,6 +440,9 @@ class WujiHandAdapter:
                     reported = getattr(hand, "handedness_name", lambda: None)()
                     normalized = str(reported).lower() if reported is not None else ""
                     if normalized == self._handedness:
+                        # SDO-verified: pin it in the hand map so the next
+                        # start connects deterministically (heals stale maps).
+                        _update_hand_map(self._handedness, dev.sn)
                         return hand
                     if normalized in ("", "unknown"):
                         # The hand cannot say which side it is. With a single
