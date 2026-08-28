@@ -16,6 +16,13 @@ To run the examples in this repo, you can try:
 pip install dexcontrol[example]
 ```
 
+### Loop Node Graph
+
+The external dual-arm Vega Robot Node is documented in
+[`src/loop_bridge/README.md`](src/loop_bridge/README.md). It uses the `loop` extra
+and preserves the existing RobotEnv action/observation path while replacing the
+legacy Source Bus integration.
+
 ### Robotiq 2F-85 Gripper (optional)
 
 If you want to use a Robotiq 2F-85 gripper connected via USB-RS485, clone this

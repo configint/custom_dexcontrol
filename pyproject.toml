@@ -45,6 +45,9 @@ dev = [
     "pytest-cov>=4.1.0",
     "ruff",
     "isort>=5.12.0",
+    # Remove once loop-node is available from the package index. Declaring it
+    # directly lets uv apply the local source override while reviewing both PRs.
+    "loop-node>=0.1.0,<0.2.0",
     "pyright",
     "pre-commit",
 ]
@@ -61,9 +64,11 @@ example = [
     "tyro",
 ]
 loop = [
-    # Loop Source Bus client SDK (publishes robot-obs). Internal repo, not on PyPI.
-    "loop-sdk @ git+https://github.com/configinc/loop-sdk.git@main",
+    "loop-sdk>=0.4.2.dev0",
 ]
+
+[project.scripts]
+dexcontrol-loop-robot-node = "loop_bridge.__main__:main"
 
 [project.urls]
 Repository = "https://github.com/dexmate-ai/dexcontrol"
@@ -89,9 +94,9 @@ ignore = ["F722", "E501"]
 [tool.ruff.lint.per-file-ignores]
 "**/__init__.py" = ["F401"]
 
-[tool.hatch.metadata]
-# Required for the loop-sdk git direct reference in the `loop` extra.
-allow-direct-references = true
+[tool.uv.sources]
+loop-sdk = { path = "../../loop-sdk", editable = true }
+loop-node = { path = "../../loop/packages/loop-node", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/dexcontrol", "src/loop_bridge"]

@@ -1,18 +1,15 @@
-"""In-process Source Bus presence for the Vega RobotEnv.
+"""Expose one bimanual Vega as a Loop Robot Node.
 
-Presents a Vega robot — single- or bimanual — as ONE ``robot-obs`` source and
-executes ONE ``robot-action``, per the robot source contract. The combiner of the
-arms lives here (the robot's own repo), not in loop or loop-sdk.
+This is the Node-Graph migration of the previous ``LoopRobotClient`` bridge. It
+keeps the device-side behavior in this repository: one shared physical Vega,
+two per-arm RobotEnv services, one pre-action observation snapshot, and the
+same per-arm ``Step`` calls.
 
 - ``_LockedStepService`` is the upstream ``VegaRobotEnvService`` plus one fix: it
   serializes ``Step`` on the upstream ``_cmd_lock`` (upstream guards only ``Reset``),
   so the bus action lane can't race a Reset on shared IK/filter state.
-- ``LoopRobotEnv`` owns the bus I/O over N arm services that share ONE hardware unit:
-  an **obs poll** reads each arm's ``_create_observation`` on a clock and publishes
-  the merged ``robot-obs`` (Vega computes obs only inside ``_create_observation``, so
-  ``LoopRobotEnv`` must drive it — else teleop, which needs obs for a delta, and obs,
-  driven by the resulting action's Step, deadlock at startup); an **action lane**
-  subscribes ``robot-action`` and dispatches each arm's slice to that arm's Step.
+- ``VegaRobotNode`` publishes one typed bimanual observation, receives one typed
+  bimanual action, and dispatches each arm's slice to that arm's Step.
 
 A bimanual robot is ONE ``Robot`` exposing both arms; two per-arm services share it
 (``VegaRobot``/service take an injected ``robot``), reusing every per-arm
@@ -24,43 +21,37 @@ from __future__ import annotations
 import contextlib
 import logging
 import signal
-import sys
 import threading
-from concurrent import futures
+import time
 from collections.abc import Mapping
 from importlib.metadata import PackageNotFoundError, version
-from typing import Any, Sequence
+from typing import Any, Literal, Sequence, cast
 
-import grpc
 from loop_sdk import (
-    LoopRobotClient,
-    RobotActionFrame,
-    RobotConfig,
-    RobotConfigOptions,
+    LifecycleCallbacks,
+    LifecycleState,
+    NodeConnectionConfig,
+    ReceivedMessage,
+    RobotCommand,
+    RobotNode,
+    TensorValue,
 )
+from pydantic import BaseModel, ConfigDict, Field
 
 # Importing the upstream module runs its sys.path setup and binds the proto stubs.
 from dexcontrol.core.robotenv_vega import server as _vega_server
-from dexcontrol.core.vega.robot import SUPPORTED_ACTION_SPACES as _VEGA_SUPPORTED_ACTION_SPACES
-
-# Baked-in option menus the recorder shows on robot-step's config picker. Vega
-# knows its supported types; a customer that ships a different robot (e.g. a
-# franka) can override any of these via the corresponding *_options kwarg on
-# serve_with_loop / serve_dual_arm. Empty tuple = no menu for that axis.
-_VEGA_DEFAULT_GRIPPER_TYPE_OPTIONS: tuple[str, ...] = ("default", "robotiq", "sr_gripper")
-_VEGA_DEFAULT_ROBOT_TYPE_OPTIONS: tuple[str, ...] = ("vega_1",)
-# Every axis advertises at least one default so config negotiation is testable
-# end-to-end (an empty axis is skipped by the picker). ``finger_type`` has no
-# hardware source yet, so a placeholder default; firmware version defaults to a
-# ``v0.0.0`` placeholder until the real value is read off the robot.
-_VEGA_DEFAULT_FINGER_TYPE_OPTIONS: tuple[str, ...] = ("default",)
-_VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS: tuple[str, ...] = ("v0.0.0",)
-from loop_bridge.obs_publisher import merge_observations
-from loop_bridge.robot_action import (
-    arm_dim_for_action_space,
-    decode_action,
+from loop_bridge.contracts import (
+    LEFT_ARM,
+    RIGHT_ARM,
+    ROBOT_ACTION_CONTRACT,
+    ROBOT_OBSERVATION_CONTRACT,
+    action_info_shape,
+    float64_tensor,
+    float64_values,
+    is_action_info_scalar,
 )
-from loop_bridge.robot_obs import DEFAULT_ARM_PREFIX
+from loop_bridge.obs_publisher import merge_observations
+from loop_bridge.robot_obs import observation_state
 
 LOGGER = logging.getLogger("loop_bridge.vega")
 
@@ -76,13 +67,25 @@ try:
     _ROBOT_SERVER_VERSION = f"dexcontrol-{version('dexcontrol')}"
 except PackageNotFoundError:
     _ROBOT_SERVER_VERSION = "dexcontrol-unknown"
-# Fallback obs publish rate when the action lane is idle. In steady state obs is now
-# driven by robot-action arrivals (each Step is followed by a fresh post-step obs), so
-# this rate governs only the boot lull and any teleop-hold gaps where actions stop
-# flowing. Kept at the engine's default control_hz so obs never falls below the rate
-# the engine expects to sample — dropping under control_hz would stall the engine's
-# per-tick obs de-dup guard. See ``LoopRobotClient.run`` for the model.
+# Fallback observation rate when the action lane is idle. Action-paired samples
+# retain the legacy pre-apply snapshot semantics.
 DEFAULT_HEARTBEAT_HZ = 20.0
+
+
+class VegaRobotNodeConfig(BaseModel):
+    """Graph-stored counterpart of the legacy negotiated RobotConfig."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    action_space: Literal["target_cartesian_delta"] = DEFAULT_ACTION_SPACE
+    gripper_action_space: Literal["", "position"] = ""
+    heartbeat_frequency_hz: float = Field(default=DEFAULT_HEARTBEAT_HZ, gt=0)
+    gripper_type: str = "default"
+    finger_type: str = "default"
+    robot_type: str = "vega_1"
+    robot_firmware_version: str = "v0.0.0"
+    robot_server_version: str = _ROBOT_SERVER_VERSION
+    teleop_server_version: str = ""
 
 
 class _BusStepContext:
@@ -103,35 +106,9 @@ class _BusStepContext:
         raise RuntimeError(f"Step aborted: {code} {details}")
 
 
-# Wire-key infix loop-sdk publishes obs under (mirror of loop_bridge.robot_obs). We
-# keep the string literal instead of importing to avoid a circular import through
-# ``__init__.py`` — this is a single fixed contract.
-_OBS_NAMESPACE = "observation.state"
-
-
-def _slice_obs_for_arm(
-    merged: Mapping[str, Any], arm_prefix: str
-) -> dict[str, Any]:
-    """Extract ONE arm's un-prefixed state dict out of the merged robot-obs payload.
-
-    Loop-sdk hands us the merged obs (keys like ``robot0.observation.state.<field>``
-    across all arms). Each arm's ``Step`` RPC wants the RobotEnv-shape dict
-    (``{joint_positions, cartesian_position, gripper_position, …}``), so pull just
-    this arm's keys and strip the ``<arm_prefix>.observation.state.`` prefix. Empty
-    dict if the merged payload has nothing for this arm (skips the pre-apply
-    override so the server falls back to its internal state read).
-    """
-    prefix = f"{arm_prefix}.{_OBS_NAMESPACE}."
-    return {
-        key[len(prefix):]: value
-        for key, value in merged.items()
-        if key.startswith(prefix)
-    }
-
-
 def _encode_pre_action_state(
     obs: Mapping[str, Any],
-) -> dict[str, "_vega_server.robotenv_pb2.Value"]:
+) -> dict[str, Any]:
     """Encode a loop-side obs dict into ``StepRequest.pre_action_state`` proto values.
 
     This is the bridge boundary where loop's ``obs`` becomes the Vega server's
@@ -140,13 +117,15 @@ def _encode_pre_action_state(
     stringify. Skips keys whose value is ``None`` so an absent reading doesn't
     spill onto the wire as a zero.
     """
-    pb2 = _vega_server.robotenv_pb2
-    encoded: dict[str, pb2.Value] = {}
+    pb2: Any = _vega_server.robotenv_pb2
+    encoded: dict[str, Any] = {}
     for key, value in obs.items():
         if value is None:
             continue
         if isinstance(value, (list, tuple)):
-            encoded[key] = pb2.Value(float_array=pb2.FloatArray(values=[float(v) for v in value]))
+            encoded[key] = pb2.Value(
+                float_array=pb2.FloatArray(values=[float(v) for v in value])
+            )
             continue
         if isinstance(value, bool):
             # bool is int in Python — must precede the int branch to encode correctly.
@@ -157,14 +136,16 @@ def _encode_pre_action_state(
             continue
         # ndarray path — mirror the Vega server's fallback shape.
         try:
-            encoded[key] = pb2.Value(float_array=pb2.FloatArray(values=[float(v) for v in value]))
+            encoded[key] = pb2.Value(
+                float_array=pb2.FloatArray(values=[float(v) for v in value])
+            )
         except TypeError:
             encoded[key] = pb2.Value(string_value=str(value))
     return encoded
 
 
 def _decode_action_info(
-    action_info: "Mapping[str, _vega_server.robotenv_pb2.Value]",
+    action_info: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Decode ``StepResponse.action_info`` proto values into a plain dict.
 
@@ -213,7 +194,8 @@ class _StepApplier:
         keyed by their bare names; the caller namespaces them per arm before merging
         onto the published robot-obs. Empty if the server sent no action info.
         """
-        request = _vega_server.robotenv_pb2.StepRequest(
+        pb2: Any = _vega_server.robotenv_pb2
+        request = pb2.StepRequest(
             action=list(action),
             action_space=action_space,
             gripper_action_space=gripper_action_space,
@@ -247,7 +229,8 @@ class _StepApplier:
         The operational counterpart to ``step``; surfaces a non-SUCCESS reset the
         same way (the bus would otherwise treat a stalled home as success).
         """
-        request = _vega_server.robotenv_pb2.ResetRequest(mode="home", params={})
+        pb2: Any = _vega_server.robotenv_pb2
+        request = pb2.ResetRequest(mode="home", params={})
         response = self._service.Reset(request, _BusStepContext())
         status = getattr(response, "status", "") or ""
         if status and status != "SUCCESS":
@@ -271,338 +254,178 @@ class _LockedStepService(_vega_server.VegaRobotEnvService):
             return super().Step(request, context)
 
 
-class LoopRobotEnv:
-    """A Vega RobotEnv presented on loop: one robot-obs out, one robot-action in, over N arm services sharing a robot.
+class VegaRobotNode(RobotNode[VegaRobotNodeConfig]):
+    """One typed Robot Node backed by the existing two-arm RobotEnv services."""
 
-    Obs cadence is now driven by robot-action arrivals — each incoming action is Stepped
-    and the post-step observation is republished immediately, so obs rate collapses to
-    control rate rather than the previous 100 Hz free-run. ``heartbeat_hz`` is the
-    fallback rate for the boot lull (before any action) and for teleop-hold gaps where
-    no action is flowing; when actions arrive at or above that rate the heartbeat obs
-    is suppressed. See ``LoopRobotClient.run`` in loop-sdk.
-    """
+    config_type = VegaRobotNodeConfig
 
-    def __init__(
-        self,
-        arm_services: Sequence[tuple[str, Any]],
-        *,
-        loop_addr: str,
-        action_space: str = DEFAULT_ACTION_SPACE,
-        gripper_action_space: str = "",
-        heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
-        enable_action: bool = True,
-        action_space_options: Sequence[str] = (),
-        gripper_type_options: Sequence[str] = (),
-        finger_type_options: Sequence[str] = (),
-        robot_type_options: Sequence[str] = (),
-        robot_firmware_version_options: Sequence[str] = (),
-    ) -> None:
-        if heartbeat_hz <= 0:
-            raise ValueError(f"heartbeat_hz must be > 0, got {heartbeat_hz}")
-        if not arm_services:
-            raise ValueError("at least one (arm_prefix, service) is required")
-        self._arm_services = tuple(arm_services)
-        arm_prefixes = [arm_prefix for arm_prefix, _ in self._arm_services]
-        if len(set(arm_prefixes)) != len(arm_prefixes):
-            raise ValueError(f"duplicate arm prefixes: {arm_prefixes}")
-
-        self._action_space = action_space
-        self._gripper_action_space = gripper_action_space
-        self._heartbeat_hz = heartbeat_hz  # fallback obs rate when the action lane is idle
-        self._lane_stop = threading.Event()
-
-        # Advertise the axes this robot owns as pickable menus the recorder shows on
-        # robot-step. Non-empty caller-provided list wins; otherwise fall back to
-        # the Vega-baked defaults so the operator doesn't need to pass a flag for
-        # every axis just to get the standard menu. Empty defaults (finger_type,
-        # firmware) still hide the picker. The control clock is NOT a per-source
-        # axis anymore — the RCI engine owns it via the cell-config's
-        # RobotConfig.control_hz, picked in the cell-config editor. robot_server_version
-        # is filled from the installed package version so the recording can pin the
-        # dexcontrol build it was captured with.
-        options = RobotConfigOptions(
-            action_space=tuple(action_space_options) or _VEGA_SUPPORTED_ACTION_SPACES,
-            gripper_type=tuple(gripper_type_options) or _VEGA_DEFAULT_GRIPPER_TYPE_OPTIONS,
-            finger_type=tuple(finger_type_options) or _VEGA_DEFAULT_FINGER_TYPE_OPTIONS,
-            robot_type=tuple(robot_type_options) or _VEGA_DEFAULT_ROBOT_TYPE_OPTIONS,
-            robot_firmware_version=tuple(robot_firmware_version_options) or _VEGA_DEFAULT_ROBOT_FIRMWARE_VERSION_OPTIONS,
-            robot_server_version=(_ROBOT_SERVER_VERSION,),
+    def __init__(self, arm_services: Sequence[tuple[str, Any]]) -> None:
+        services = tuple(arm_services)
+        arms = tuple(arm for arm, _service in services)
+        if arms != (LEFT_ARM, RIGHT_ARM):
+            raise ValueError(
+                f"VegaRobotNode requires ordered left/right arm services, received {arms}"
+            )
+        self._arm_services = services
+        self._appliers = {
+            arm: _StepApplier(service) for arm, service in self._arm_services
+        }
+        self._device_lock = threading.RLock()
+        self._heartbeat_stop = threading.Event()
+        self._heartbeat_thread: threading.Thread | None = None
+        self._heartbeat_hz = DEFAULT_HEARTBEAT_HZ
+        self._action_space = DEFAULT_ACTION_SPACE
+        self._gripper_action_space = ""
+        self._last_publish_ns = 0
+        self._active = False
+        super().__init__(
+            config_type=VegaRobotNodeConfig,
+            observation_contract=ROBOT_OBSERVATION_CONTRACT,
+            action_contract=ROBOT_ACTION_CONTRACT,
+            action_handler=self._apply_action,
+            command_handler=self._handle_command,
+            input_capacity=32,
+            lifecycle=LifecycleCallbacks(
+                start=self._on_start,
+                stop=self._on_stop,
+                reset_fault=self._on_reset_fault,
+            ),
         )
 
-        # The opaque robot-action / teleop-action / policy-action vector is a plain
-        # concatenation of per-arm blocks (arm order, ``arm_dim`` each) — no channel
-        # layout is advertised; producers and this server agree on it out-of-band via
-        # ``action_space``. Validate the space up front so an unknown one fails here.
-        arm_dim_for_action_space(action_space)
-
-        def apply_config(config: RobotConfig) -> RobotConfig:
-            self.reconfigure(action_space=config.action_space)
-            return config
-
-        # One bus object owns the whole link: publish robot-obs + (when enabled)
-        # consume robot-action + robot-command. Source ids are pinned by the SDK facade
-        # (our lane convention); LoopRobotEnv owns the per-arm action decode. Obs-only
-        # (enable_action=False) wires neither input lane.
-        self._loop_robot_client = LoopRobotClient(
-            loop_addr,
-            options=options,
-            apply_config_callback=apply_config,
-            enable_action=enable_action,
-        )
-
-        self._appliers: dict[str, _StepApplier] = {}
-        if enable_action:
-            self._appliers = {
-                arm_prefix: _StepApplier(service)
-                for arm_prefix, service in self._arm_services
-            }
-
-        # The SDK owns the loop. Vega is in-process with the RobotEnv gRPC server, so
-        # ``run`` goes on a daemon thread (the main thread serves Step +
-        # waits for shutdown). It publishes the bootstrap obs on connect (that first
-        # publish is what breaks the obs/action startup cycle), then republishes obs
-        # after each Step / home, and falls back to ``heartbeat_hz`` when actions stall.
-        # Obs-only mode (``enable_action=False``) has no action lane, so we still fall
-        # back to the legacy clock-driven ``run`` in that mode — see ``_run_loop_client``.
-        loop_thread = threading.Thread(
-            target=self._run_loop_client,
-            kwargs=dict(enable_action=enable_action),
-            name="robot-obs-poll",
+    def _on_start(self, config: VegaRobotNodeConfig) -> None:
+        with self._device_lock:
+            self._action_space = config.action_space
+            self._gripper_action_space = config.gripper_action_space
+            self._heartbeat_hz = config.heartbeat_frequency_hz
+            self._heartbeat_stop.clear()
+            self._active = True
+            self._read_and_publish()
+        thread = threading.Thread(
+            target=self._heartbeat_loop,
+            name="vega-robot-observation-heartbeat",
             daemon=True,
         )
-        loop_thread.start()
-        self._threads: list[threading.Thread] = [loop_thread]
+        self._heartbeat_thread = thread
+        thread.start()
 
-        LOGGER.info(
-            "loop robot env enabled: robot-obs %r (%s, heartbeat=%.1f Hz, action-driven) -> %s%s",
-            LoopRobotClient.OBS_SOURCE_ID,
-            arm_prefixes,
-            heartbeat_hz,
-            loop_addr,
-            f"; robot-action {LoopRobotClient.ACTION_SOURCE_ID!r} -> Step({action_space})"
-            if enable_action
-            else "",
-        )
+    def _on_stop(self) -> None:
+        with self._device_lock:
+            self._active = False
+            self._heartbeat_stop.set()
+        thread = self._heartbeat_thread
+        if thread is not None:
+            thread.join()
+        self._heartbeat_thread = None
 
-    def reconfigure(self, action_space: str = "") -> None:
-        """Apply a Source-Bus-selected config: re-target Step's action space.
+    def _on_reset_fault(self) -> None:
+        self._on_stop()
 
-        Called from the obs sender's ``apply_config`` when the recorder picks a config.
-        The RCI engine's control clock is no longer part of this negotiation. If the
-        new ``action_space`` matches the current one, this is a no-op. If it has a
-        DIFFERENT ``arm_dim`` than the initial space, the per-arm block size the
-        decoder slices the opaque action vector against would change mid-session — we
-        refuse loudly rather than silently step wrong slices (older
-        ``target_cartesian_delta`` vectors would slice against a fresh joint-space
-        block size). Reconnect the robot server to pick up the new space in that case.
-        """
-        if not action_space or action_space == self._action_space:
-            return
-        try:
-            new_dim = arm_dim_for_action_space(action_space)
-        except KeyError:
-            LOGGER.warning(
-                "reconfigure: unknown action_space %r; keeping %r",
-                action_space, self._action_space,
-            )
-            return
-        old_dim = arm_dim_for_action_space(self._action_space)
-        if new_dim != old_dim:
-            LOGGER.warning(
-                "reconfigure: action_space %r has arm_dim=%d, initial %r had %d; "
-                "the per-arm block size the decoder slices against was fixed at "
-                "connect and cannot be resized live — REJECTING the change. Reconnect "
-                "the robot server if the recorder needs the new space.",
-                action_space, new_dim, self._action_space, old_dim,
-            )
-            return
-        self._action_space = action_space
+    def _heartbeat_loop(self) -> None:
+        period_s = 1.0 / self._heartbeat_hz
+        grace_ns = round(2.0 * period_s * 1_000_000_000)
+        while not self._heartbeat_stop.wait(period_s):
+            with self._device_lock:
+                if not self._active:
+                    return
+                idle_ns = time.monotonic_ns() - self._last_publish_ns
+                if idle_ns < grace_ns:
+                    continue
+                try:
+                    self._read_and_publish()
+                except Exception:
+                    LOGGER.exception(
+                        "heartbeat robot observation publish failed; retrying next period"
+                    )
 
-    def _run_loop_client(self, *, enable_action: bool) -> None:
-        """Thread body: drive the SDK loop, surfacing a fatal exit (live robot — a silent
-        daemon-thread death would freeze obs/action with no signal).
+    def _read_observations(self) -> tuple[dict[str, Mapping[str, Any]], dict[str, Any]]:
+        observations: dict[str, Mapping[str, Any]] = {}
+        for arm, service in self._arm_services:
+            observation, _sample_timestamp_us = service._create_observation()
+            observations[arm] = observation
+        return observations, merge_observations(observations)
 
-        With the action lane enabled we take the event-driven path (``LoopRobotClient.run``)
-        so obs cadence follows each incoming ``robot-action``. Obs-only mode has no action
-        lane to hang the cadence on, so we fall back to the clock-driven ``stream_obs`` at
-        ``heartbeat_hz``.
-        """
-        try:
-            if enable_action:
-                self._loop_robot_client.run(
-                    publish_obs_callback=self._read_obs,
-                    apply_action_callback=self._apply_action,
-                    home_callback=self._home_all_arms,
-                    heartbeat_hz=self._heartbeat_hz,
-                    stop=self._lane_stop,
-                )
+    def _read_and_publish(self) -> None:
+        _observations, payload = self._read_observations()
+        self._publish_observation(payload)
+
+    def _publish_observation(self, payload: Mapping[str, Any]) -> None:
+        # Match the former LoopRobotClient stamp: wall-clock capture time on the
+        # wire, while heartbeat scheduling remains on the monotonic clock.
+        self.publish_observation(payload, timestamp_ns=time.time_ns())
+        self._last_publish_ns = time.monotonic_ns()
+
+    def _apply_action(self, message: ReceivedMessage) -> None:
+        """Preserve the legacy read-before-Step and paired-publish ordering."""
+
+        with self._device_lock:
+            if not self._active:
                 return
-            self._loop_robot_client.stream_obs(
-                publish_obs_callback=self._read_obs,
-                hz=self._heartbeat_hz,
-                stop=self._lane_stop,
-            )
-        except Exception:
-            LOGGER.exception("loop robot env run() thread exited with an error")
+            observations, payload = self._read_observations()
+            actions = _decode_bimanual_action(message)
+            flat_action = (*actions[LEFT_ARM], *actions[RIGHT_ARM])
+            payload["received_action"] = float64_tensor(flat_action, shape=(14,))
+            for arm, applier in self._appliers.items():
+                try:
+                    action_info = applier.step(
+                        actions[arm],
+                        self._action_space,
+                        self._gripper_action_space,
+                        pre_apply_obs=observation_state(observations[arm]),
+                    )
+                except Exception as error:
+                    LOGGER.warning(
+                        "action Step failed for %s; skipping: %s",
+                        arm,
+                        error,
+                    )
+                    continue
+                payload.update(_action_info_payload(arm, action_info))
+            self._publish_observation(payload)
 
-    def _read_obs(self) -> dict[str, Any]:
-        """``publish_obs_callback``: read every arm's observation (paired) and merge into one robot-obs.
-
-        Returns the merged payload for ``run()`` to publish. The SDK stamps the
-        timestamp itself — the per-arm sample timestamp is not preserved on the wire.
-        """
-        observations: dict[str, Any] = {}
-        for arm_prefix, service in self._arm_services:
-            observation, _sample_ts = service._create_observation()
-            observations[arm_prefix] = observation
-        return merge_observations(observations)
-
-    def _home_all_arms(self) -> None:
-        """``home_callback``: home every arm (per-arm failure logged + skipped).
-
-        The SDK matches the ``home`` command for us, so this just runs the action.
-        """
-        for arm_prefix, applier in self._appliers.items():
-            try:
-                applier.home()
-            except Exception as exc:
-                LOGGER.warning("home failed for %s; skipping: %s", arm_prefix, exc)
-
-    def _apply_action(
-        self, action: RobotActionFrame, pre_apply_obs: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """``apply_action_callback``: slice the opaque vector into per-arm blocks
-        and Step each arm. ``action.values`` is a plain concatenation of per-arm
-        blocks in arm order, each ``arm_dim`` long (agreed out-of-band via
-        ``action_space``); arm ``i`` owns block ``i``.
-
-        ``pre_apply_obs`` is the exact snapshot loop-sdk just captured for the
-        paired robot-obs publish — we forward it into each arm's ``Step`` so the
-        upstream RobotEnv service dispatches against the same state loop will
-        record, instead of re-reading state a moment later. That collapses the
-        two-reads race in the SDK-plus-server pipeline and gives a true single-
-        source (state, action) pair.
-
-        Returns the per-arm ``<arm>.action.<field>`` channels the server derived while
-        applying the action (desired_velocity, delta_action, resolved cartesian, ...) to
-        merge onto that same robot-obs sample; empty dict when nothing stepped. The raw
-        received action is added by loop-sdk itself (flat ``received_action``), so we do
-        not repeat it per arm here.
-
-        A short action vector that doesn't cover an arm's block (decode returns None)
-        must NOT collapse the other arms' steps or the obs-driven cadence — skip only
-        that arm this tick.
-        """
-        if not self._appliers:
-            return {}
-        arm_dim = arm_dim_for_action_space(self._action_space)
-        action_channels: dict[str, Any] = {}
-        for arm_index, (arm_prefix, applier) in enumerate(self._appliers.items()):
-            arm_action = decode_action(action.values, arm_index, arm_dim)
-            if arm_action is None:
-                continue
-            # Slice the merged pre-apply obs down to just THIS arm's state fields
-            # (un-prefixed) — the Vega server's Step / update_command expects the
-            # RobotEnv-style dict {joint_positions, cartesian_position, ...}, not
-            # the loop-sdk wire keys (``<arm>.observation.state.<field>``).
-            arm_pre_apply_obs = _slice_obs_for_arm(pre_apply_obs, arm_prefix)
-            try:
-                arm_action_info = applier.step(
-                    arm_action,
-                    self._action_space,
-                    self._gripper_action_space,
-                    pre_apply_obs=arm_pre_apply_obs,
-                )
-            except Exception as exc:  # _StepApplier raises on non-SUCCESS Step; skip
-                LOGGER.warning(
-                    "robot-action Step failed for %s; skipping: %s", arm_prefix, exc
-                )
-                continue
-            for field, value in arm_action_info.items():
-                action_channels[f"{arm_prefix}.action.{field}"] = value
-        return action_channels
-
-    def close(self) -> None:
-        """Stop the lane and close the bus link (BEFORE closing the robot)."""
-        self._lane_stop.set()
-        for thread in self._threads:
-            thread.join(timeout=5.0)
-            if thread.is_alive():
-                LOGGER.warning(
-                    "lane thread %r did not stop within timeout", thread.name
-                )
-        with contextlib.suppress(Exception):
-            self._loop_robot_client.disconnect()  # stops sender + action/command subscribe threads
+    def _handle_command(self, command: RobotCommand) -> None:
+        if command is not RobotCommand.HOME:
+            raise ValueError(f"unsupported robot command: {command.value!r}")
+        with self._device_lock:
+            if not self._active:
+                raise RuntimeError("Vega Robot Node is not active")
+            _observations, payload = self._read_observations()
+            for arm, applier in self._appliers.items():
+                try:
+                    applier.home()
+                except Exception as error:
+                    LOGGER.warning("home failed for %s; skipping: %s", arm, error)
+            self._publish_observation(payload)
 
 
-def _install_signal_shutdown(cleanup) -> None:
-    def shutdown_handler(signum, frame):
-        del signum, frame
-        LOGGER.info("Shutting down Vega RobotEnv+Loop server")
-        with contextlib.suppress(Exception):
-            cleanup()
-        sys.exit(0)
+def _decode_bimanual_action(message: ReceivedMessage) -> dict[str, list[float]]:
+    actions: dict[str, list[float]] = {}
+    for arm in (LEFT_ARM, RIGHT_ARM):
+        field = f"{arm}.target_cartesian_delta"
+        delta = float64_values(
+            cast(TensorValue, message.payload[field]),
+            field_name=field,
+            shape=(6,),
+        )
+        gripper_value = message.payload[f"{arm}.gripper_position"]
+        if isinstance(gripper_value, bool) or not isinstance(
+            gripper_value, (int, float)
+        ):
+            raise TypeError(f"{arm}.gripper_position must be a scalar")
+        gripper = float(gripper_value)
+        actions[arm] = [*delta, gripper]
+    return actions
 
-    signal.signal(signal.SIGINT, shutdown_handler)
-    signal.signal(signal.SIGTERM, shutdown_handler)
 
-
-def serve_with_loop(
-    *,
-    loop_addr: str,
-    grpc_port: int = 50061,
-    arm_prefix: str = DEFAULT_ARM_PREFIX,
-    action_space: str = DEFAULT_ACTION_SPACE,
-    gripper_action_space: str = "",
-    heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
-    enable_action: bool = True,
-    action_space_options: Sequence[str] = (),
-    gripper_type_options: Sequence[str] = (),
-    finger_type_options: Sequence[str] = (),
-    robot_type_options: Sequence[str] = (),
-    robot_firmware_version_options: Sequence[str] = (),
-    **service_kwargs: Any,
-) -> None:
-    """Single-arm: a RobotEnv gRPC server that also bridges one robot-obs/robot-action."""
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
-    )
-
-    service = _LockedStepService(**service_kwargs)  # builds its own one-arm Robot
-    env = LoopRobotEnv(
-        [(arm_prefix, service)],
-        loop_addr=loop_addr,
-        action_space=action_space,
-        gripper_action_space=gripper_action_space,
-        heartbeat_hz=heartbeat_hz,
-        enable_action=enable_action,
-        action_space_options=action_space_options,
-        gripper_type_options=gripper_type_options,
-        finger_type_options=finger_type_options,
-        robot_type_options=robot_type_options,
-        robot_firmware_version_options=robot_firmware_version_options,
-    )
-
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=10))
-    _vega_server.robotenv_pb2_grpc.add_RobotEnvServicer_to_server(service, server)
-    server.add_insecure_port(f"0.0.0.0:{grpc_port}")
-    server.start()
-    LOGGER.info(
-        "Vega RobotEnv+Loop server on 0.0.0.0:%d (robot-obs=%r)",
-        grpc_port,
-        LoopRobotClient.OBS_SOURCE_ID,
-    )
-
-    def cleanup() -> None:
-        # Lanes first (no Step/obs read in flight), then control loop, then robot.
-        env.close()
-        for teardown in (service._stop_control_loop, service._robot.close):
-            with contextlib.suppress(Exception):
-                teardown()
-        server.stop(grace=5)
-
-    _install_signal_shutdown(cleanup)
-    server.wait_for_termination()
+def _action_info_payload(arm: str, action_info: Mapping[str, Any]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for field, value in action_info.items():
+        shape = action_info_shape(field)
+        if shape is not None:
+            payload[f"{arm}.action.{field}"] = float64_tensor(value, shape=shape)
+            continue
+        if is_action_info_scalar(field):
+            payload[f"{arm}.action.{field}"] = float(value)
+    return payload
 
 
 _SERIAL_GRIPPERS = ("robotiq", "sr_gripper")
@@ -636,22 +459,13 @@ def _dual_arm_comports(
 
 def serve_dual_arm(
     *,
-    loop_addr: str,
-    arm_prefixes: tuple[str, str] = ("robot0", "robot1"),
-    action_space: str = DEFAULT_ACTION_SPACE,
-    gripper_action_space: str = "",
-    heartbeat_hz: float = DEFAULT_HEARTBEAT_HZ,
-    enable_action: bool = True,
-    action_space_options: Sequence[str] = (),
-    gripper_type_options: Sequence[str] = (),
-    finger_type_options: Sequence[str] = (),
-    robot_type_options: Sequence[str] = (),
-    robot_firmware_version_options: Sequence[str] = (),
+    node_id: str,
+    connection: NodeConnectionConfig,
     left_robotiq_comport: str | None = None,
     right_robotiq_comport: str | None = None,
     **service_kwargs: Any,
 ) -> None:
-    """Bimanual: ONE Vega robot, both arms, presented as one robot-obs/robot-action.
+    """Run one external bimanual Robot Node over one shared physical Vega.
 
     Builds the left service (which constructs the one ``Robot`` with both arms), then
     a right service that SHARES that Robot (injected), so both arms run over one
@@ -666,51 +480,48 @@ def serve_dual_arm(
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    left_prefix, right_prefix = arm_prefixes
-
     left_comport, right_comport = _dual_arm_comports(
         service_kwargs, left_robotiq_comport, right_robotiq_comport
     )
-    left = _LockedStepService(arm_side="left", **{**service_kwargs, "robotiq_comport": left_comport})
+    left = _LockedStepService(
+        arm_side="left", **{**service_kwargs, "robotiq_comport": left_comport}
+    )
     shared_robot = left._robot.robot  # the one hardware unit (both arms) left built
     right = _LockedStepService(
-        arm_side="right", robot=shared_robot, **{**service_kwargs, "robotiq_comport": right_comport}
+        arm_side="right",
+        robot=shared_robot,
+        **{**service_kwargs, "robotiq_comport": right_comport},
     )
 
-    env = LoopRobotEnv(
-        [(left_prefix, left), (right_prefix, right)],
-        loop_addr=loop_addr,
-        action_space=action_space,
-        gripper_action_space=gripper_action_space,
-        heartbeat_hz=heartbeat_hz,
-        enable_action=enable_action,
-        action_space_options=action_space_options,
-        gripper_type_options=gripper_type_options,
-        finger_type_options=finger_type_options,
-        robot_type_options=robot_type_options,
-        robot_firmware_version_options=robot_firmware_version_options,
-    )
+    node = VegaRobotNode([(LEFT_ARM, left), (RIGHT_ARM, right)])
+    node.start(node_id=node_id, connection=connection)
     LOGGER.info(
-        "Vega dual-arm robot env running: arms=%s robot-obs=%r",
-        list(arm_prefixes),
-        LoopRobotClient.OBS_SOURCE_ID,
+        "Vega dual-arm Robot Node connected: node_id=%s arms=%s",
+        node_id,
+        [LEFT_ARM, RIGHT_ARM],
     )
 
-    def cleanup() -> None:
-        # Lanes first (no Step/obs read in flight), then per-arm control loops, then
-        # close each VegaRobot — VegaRobot.close() stops that arm's gripper worker AND
-        # calls the shared Robot.shutdown() (idempotent, so the second call is a no-op
-        # but still stops the right arm's gripper). Using the raw shared_robot.close()
-        # would only release the comm node, leaving both arms energized + threads leaked.
-        env.close()
+    stop_requested = threading.Event()
+
+    def request_stop(_signum: int, _frame: Any) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGINT, request_stop)
+    signal.signal(signal.SIGTERM, request_stop)
+    try:
+        while node.is_running and not stop_requested.is_set():
+            node.process_control(timeout_s=0.1)
+    finally:
+        LOGGER.info("Shutting down Vega dual-arm Robot Node")
+        # Stop Node data callbacks before releasing the shared hardware.
+        with contextlib.suppress(Exception):
+            if node.status.lifecycle is not LifecycleState.FINALIZED:
+                node.shutdown()
+        with contextlib.suppress(Exception):
+            node.close()
         for service in (left, right):
             with contextlib.suppress(Exception):
                 service._stop_control_loop()
         for service in (left, right):
             with contextlib.suppress(Exception):
                 service._robot.close()
-
-    _install_signal_shutdown(cleanup)
-    # No gRPC server here: actions arrive via the bus, obs leave via the bus. The
-    # the loop robot env owns the lifetime; block until a shutdown signal.
-    threading.Event().wait()
