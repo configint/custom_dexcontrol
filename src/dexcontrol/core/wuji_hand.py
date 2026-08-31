@@ -184,6 +184,40 @@ def _sn_from_hand_map(handedness: str) -> str | None:
     return sn
 
 
+def _detect_nid_scheme(nids) -> str:
+    """Wuji Hand 2 joint `nid` numbering scheme, from observed nids.
+
+    CONFIRMED by the vendor's own device snapshot (`wuji logs export`,
+    2026-08-26, WH2JA01260801015): the fault table lists exactly nids
+    1-4, 6-9, 11-14, 16-19, 21-24 — STRIDE-5 finger groups, 1-based
+    (thumb 1-4, index 6-9, middle 11-14, ring 16-19, pinky 21-24;
+    multiples of 5 unused). Decoding them as a contiguous range shifts
+    every observation from the index finger on (an index wiggle showed
+    up in the middle-J2 slot). Contiguous 0/1-based schemes are kept as
+    fallbacks for other firmware revisions.
+    """
+    if max(nids) > _N_JOINTS:
+        return "stride5"
+    if 0 in nids:
+        return "zero"          # contiguous 0..19
+    if any(n in nids for n in (5, 10, 15, 20)):
+        return "one"           # contiguous 1..20
+    # No discriminator (e.g. pinky joints not yet reported): stride-5 is
+    # the vendor-confirmed layout — default to it.
+    return "stride5"
+
+
+def _nid_to_joint(nid: int, scheme: str) -> int:
+    """Device nid -> firmware joint index (0..19); -1 when out of range."""
+    if scheme == "stride5":
+        group, within = (nid - 1) // 5, (nid - 1) % 5
+        if nid < 1 or within >= _JOINTS_PER_FINGER or group >= _N_FINGERS:
+            return -1
+        return group * _JOINTS_PER_FINGER + within
+    idx = nid - 1 if scheme == "one" else nid
+    return idx if 0 <= idx < _N_JOINTS else -1
+
+
 def _update_hand_map(handedness: str, sn: str) -> None:
     """Record a VERIFIED handedness->sn binding (best effort).
 
@@ -309,7 +343,7 @@ class WujiHandAdapter:
             # Hand 2 joint ids: assumed 0-based; auto-detected from the first
             # frame (a 1..20 range means 1-based) since the SDK contract is
             # not documented. None until detected.
-            self._nid_offset: int | None = None
+            self._nid_scheme: str | None = None
 
             # Command channel (model-specific) + state/tactile subscriptions.
             self._configure_control(effort_limit, mit_kp, mit_kd,
@@ -729,24 +763,21 @@ class WujiHandAdapter:
                 return
             if self._is_hand2:
                 # Variable-length list of online joints; update per nid so a
-                # briefly offline joint keeps its last value. The nid base is
-                # undocumented — detect once from the first frame (M1 verifies
-                # on hardware).
-                if self._nid_offset is None and latest.joints:
-                    nids = [e.nid for e in latest.joints]
-                    if min(nids) >= 1 and max(nids) == _N_JOINTS:
-                        self._nid_offset = 1
-                        logger.warning(
-                            "Wuji Hand 2 ({}): joint nids look 1-based; "
-                            "applying -1 offset.", self._handedness,
-                        )
-                    else:
-                        self._nid_offset = 0
-                offset = self._nid_offset or 0
+                # briefly offline joint keeps its last value. The nid scheme
+                # is stride-5 finger groups on current firmware, detected
+                # from the observed nids — see _detect_nid_scheme.
+                if self._nid_scheme is None and latest.joints:
+                    self._nid_scheme = _detect_nid_scheme(
+                        [e.nid for e in latest.joints])
+                    logger.info(
+                        "Wuji Hand 2 ({}): joint nid scheme = {}.",
+                        self._handedness, self._nid_scheme,
+                    )
+                scheme = self._nid_scheme or "stride5"
                 with self._state_lock:
                     for entry in latest.joints:
-                        idx = entry.nid - offset
-                        if 0 <= idx < _N_JOINTS:
+                        idx = _nid_to_joint(entry.nid, scheme)
+                        if idx >= 0:
                             self._cached_pos[idx] = entry.position
             else:
                 pos = np.asarray(latest.position, dtype=np.float64)
