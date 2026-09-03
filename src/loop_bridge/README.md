@@ -11,10 +11,7 @@ uv sync --extra loop --extra dev
 
 uv run dexcontrol-loop-robot-node \
   --node-id robot \
-  --loop-endpoint tcp/127.0.0.1:7447 \
-  --status-period-ms 250 \
-  --control-request-capacity 16 \
-  --data-request-capacity 16 \
+  --loop-endpoint tcp/127.0.0.1:7448 \
   --gripper-type robotiq \
   --robotiq-comport-left /dev/ttyUSB0 \
   --robotiq-comport-right /dev/ttyUSB1
