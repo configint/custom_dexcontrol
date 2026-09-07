@@ -22,6 +22,16 @@ position commands through a joint_command publisher — so the adapter
 auto-detects the model at connect time (isinstance(hand, WujiHand2)) and
 hides the difference behind set_joint_pos().
 
+Target shaping is the same for both generations: a first-order low-pass
+(`lowpass_cutoff_hz`, 5 Hz default) between the caller's targets and the
+motors. For first gen the SDK realtime controller applies it while
+interpolating to the 1 kHz PDO tick. Hand 2's SDK exposes only the raw MIT
+stream, so the adapter applies it itself in the worker (`_shape_hand2`).
+Commands are position-only (velocity/effort feedforward 0), exactly like the
+vendor's teleop example — which feeds 120 Hz low-passed targets; our callers
+send 20 Hz steps (robot server control_hz), which fed raw into a soft,
+lightly damped impedance loop lag and ring visibly.
+
 Same worker-thread contract as RobotiqGripper: the cached position is
 updated only from real joint_states frames — `set_joint_pos` never writes
 the commanded target into the cache. A watchdog stops republishing
@@ -271,7 +281,7 @@ class WujiHandAdapter:
         lowpass_cutoff_hz: float = 5.0,
         mit_kp: float = 3.0,
         mit_kd: float = 0.05,
-        command_hz: float = 100.0,
+        command_hz: float | None = None,
         init_timeout: float = 15.0,
         joint_limits: np.ndarray | None = None,
     ) -> None:
@@ -282,10 +292,15 @@ class WujiHandAdapter:
                 Used to pick the device when no serial number is given.
             sn: Explicit device serial number; wins over handedness.
             effort_limit: Per-joint current cap in Amps. Keep low for bring-up.
-            lowpass_cutoff_hz: First-gen realtime controller filter cutoff.
+            lowpass_cutoff_hz: Target low-pass cutoff (Hz) for BOTH
+                generations — first gen via the SDK realtime controller,
+                Hand 2 via the adapter's worker-side filter (see _shape_hand2).
             mit_kp/mit_kd: Hand 2 MIT impedance gains.
             command_hz: Worker republish rate (Hand 2 needs a continuous MIT
-                command stream; this also acts as a keepalive).
+                command stream; this also acts as a keepalive). None = the
+                per-model default: 200 Hz for Hand 2 (the rate of the vendor's
+                own joint_command publish example; finer low-pass steps),
+                100 Hz for first gen (unchanged — the SDK filters at 500 Hz).
             init_timeout: Seconds to wait for scan/enable to complete.
             joint_limits: Optional (20, 2) [lower, upper] radians override.
         """
@@ -296,10 +311,36 @@ class WujiHandAdapter:
             "1", "on", "true",
         )
 
-        self._command_hz = float(command_hz)
+        # Validate every numeric knob BEFORE connecting: a bad value must fail
+        # here, not after the SDK session (and motors) are already claimed.
+        if command_hz is not None and not float(command_hz) > 0.0:
+            raise ValueError(f"command_hz must be > 0, got {command_hz!r}")
+        self._command_hz_arg = command_hz
+        self._lowpass_cutoff_hz = float(lowpass_cutoff_hz)
+        if not self._lowpass_cutoff_hz > 0.0:
+            raise ValueError(f"lowpass_cutoff_hz must be > 0, got {lowpass_cutoff_hz!r}")
+        # Hand 2 command shaping state (worker thread only): the low-passed
+        # command actually on the wire, and when it was last sent.
+        self._cmd_pos: np.ndarray | None = None
+        self._last_send_time: float | None = None
+        # Per-joint "this joint has appeared in a joint_states frame" mask —
+        # set on ANY report, finite or not, so a joint that is NaN from its
+        # very first frame is judged like every other reported joint (seed
+        # gate + watchdog) instead of passing as a never-reported offline
+        # motor. Joints never reported are seeded from the target since
+        # nothing drives them anyway.
+        self._state_seen_mask = np.zeros(_N_JOINTS, dtype=bool)
+        # Per-joint time of the last FINITE measurement (anchored at the
+        # joint's first report). The link watchdog is judged per joint over
+        # the reported joints, so one healthy joint can never mask another
+        # joint's persistent NaN.
+        self._last_valid_time = np.zeros(_N_JOINTS, dtype=np.float64)
+        self._hold_reason: str | None = None
+        self._nonfinite_warned: set[int] = set()
         self._manager = SdkManager.instance()
         self._hand = self._connect(sn, init_timeout)
         self._is_hand2 = isinstance(self._hand, WujiHand2)
+        self._command_hz = self._resolve_command_hz(self._command_hz_arg, self._is_hand2)
         # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
         # after connect, once the model is known); WUJI_TACTILE=on/off is an
         # explicit override. When enabled, a missing/dead tactile stream is a
@@ -392,16 +433,36 @@ class WujiHandAdapter:
             raise
 
         logger.info(
-            "Wuji {} ({}) ready: sn={}, tactile={}, async worker started.",
+            "Wuji {} ({}) ready: sn={}, tactile={}, command stream {:.0f} Hz "
+            "(low-pass {:.1f} Hz), async worker started.",
             "Hand v2" if self._is_hand2 else "Hand v1",
             handedness,
             self.serial_number,
             "on" if self._tactile_enabled else "off",
+            self._command_hz,
+            self._lowpass_cutoff_hz,
         )
 
     # ------------------------------------------------------------------
     # Connection / configuration
     # ------------------------------------------------------------------
+
+    # Worker rate defaults per model. Hand 2: 200 Hz = the vendor's
+    # joint_command publish example (its teleop example runs 120 Hz; the
+    # firmware accepts up to 1 kHz and holds the last command between
+    # frames). First gen keeps its historical 100 Hz — the SDK realtime
+    # controller resamples to 500 Hz itself, so nothing is gained there.
+    _HAND2_COMMAND_HZ = 200.0
+    _HAND1_COMMAND_HZ = 100.0
+
+    @classmethod
+    def _resolve_command_hz(cls, requested: float | None, is_hand2: bool) -> float:
+        if requested is None:
+            return cls._HAND2_COMMAND_HZ if is_hand2 else cls._HAND1_COMMAND_HZ
+        hz = float(requested)
+        if not hz > 0.0:
+            raise ValueError(f"command_hz must be > 0, got {requested!r}")
+        return hz
 
     def _connect(self, sn: str | None, init_timeout: float):
         """Scan and connect the requested hand device.
@@ -415,6 +476,18 @@ class WujiHandAdapter:
         if sn is None:
             sn = _sn_from_hand_map(self._handedness)
             if sn is not None:
+                map_side = _sn_handedness(sn)
+                if map_side is not None and map_side != self._handedness:
+                    # The map is the one path that binds WITHOUT verification,
+                    # so a contradictory entry would silently drive this arm
+                    # with the other side's hand. Refuse and name the fix.
+                    raise RuntimeError(
+                        f"Wuji hand map {_HAND_MAP_PATH} pins {self._handedness}="
+                        f"{sn}, but that serial is a {map_side.upper()} hand by "
+                        f"the SN convention (4th char J=left/K=right). Fix or "
+                        f"delete the map entry (it is rewritten automatically on "
+                        f"the next verified start)."
+                    )
                 sn_from_map = True
                 logger.info(
                     "Wuji hand ({}): using sn={} from {}.",
@@ -428,6 +501,7 @@ class WujiHandAdapter:
         # OTHER hands are visible. An explicit --wuji-sn never falls back.
         map_grace_deadline = time.monotonic() + min(5.0, init_timeout / 2)
         hand_types = (DeviceType.WujiHand, DeviceType.WujiHand2)
+        other_side_logged = False
         while True:
             devices = [d for d in self._manager.scan() if d.device_type in hand_types]
             if sn is not None:
@@ -452,7 +526,26 @@ class WujiHandAdapter:
                 # verify after connect when the SDK reports handedness.
                 candidates = [d for d in devices if _sn_handedness(d.sn) == self._handedness]
                 if not candidates and devices:
-                    candidates = devices
+                    # Only hands whose SN carries NO side (v1 STM32 UIDs) may be
+                    # probed as a fallback. A hand the SN convention already
+                    # assigns to the OTHER side is never a candidate — not even
+                    # when it is the only hand on the network. Both arm servers
+                    # resolving to the same physical hand makes it receive two
+                    # conflicting 100 Hz target streams (left live + right
+                    # held) and oscillate violently; failing here instead
+                    # points at the real fault (the missing hand / its link).
+                    candidates = [d for d in devices if _sn_handedness(d.sn) is None]
+                    if not candidates and not other_side_logged:
+                        other_side_logged = True
+                        logger.warning(
+                            "Wuji hand ({}): the only attached hand(s) {} belong "
+                            "to the other side per the SN convention (4th char "
+                            "J=left/K=right) — refusing to bind them; waiting for "
+                            "a {} hand to appear (check its power/link/NIC).",
+                            self._handedness,
+                            [f"{d.sn}({_sn_handedness(d.sn)})" for d in devices],
+                            self._handedness,
+                        )
                 for dev in candidates:
                     try:
                         hand = self._manager.connect(
@@ -500,7 +593,9 @@ class WujiHandAdapter:
                         # there is nothing to confuse it with, so take it;
                         # with several, guessing risks driving the arm with
                         # the wrong hand — demand an explicit mapping.
-                        if len(devices) == 1:
+                        # (A hand whose SN names the OTHER side never gets
+                        # here — it is filtered out of `candidates` above.)
+                        if len(devices) == 1 and _sn_handedness(dev.sn) is None:
                             logger.warning(
                                 "Wuji hand sn={} reports handedness {!r}; accepting it "
                                 "as the {} hand because it is the only one attached.",
@@ -521,9 +616,14 @@ class WujiHandAdapter:
                     )
                     self._manager.disconnect_all()
             if time.monotonic() >= deadline:
+                seen = [f"{d.sn}({_sn_handedness(d.sn) or 'no-side'})" for d in devices]
                 raise ConnectionError(
                     f"No Wuji hand found for handedness={self._handedness!r} "
-                    f"(sn={sn!r}) within {init_timeout}s"
+                    f"(sn={sn!r}) within {init_timeout}s; hands visible on the "
+                    f"network: {seen or 'none'}. A hand whose SN names the other "
+                    f"side is never bound to this arm — check the "
+                    f"{self._handedness} hand's power, RJ45 link and NIC/IP "
+                    f"(`wuji upgrade --check` must list BOTH hands)."
                 )
             time.sleep(0.5)
 
@@ -542,7 +642,8 @@ class WujiHandAdapter:
             # The realtime controller is a context manager in the SDK examples;
             # we hold it open for the adapter's lifetime and close it in
             # shutdown(). It interpolates our command_hz targets up to the
-            # 1 kHz PDO tick (LowPass).
+            # 1 kHz PDO tick (LowPass). Hand 2 has no SDK equivalent — the
+            # same low-pass is applied in _shape_hand2 instead.
             self._rt_ctx = self._hand.realtime_controller(
                 LowPass(cutoff_hz=lowpass_cutoff_hz)
             )
@@ -714,45 +815,148 @@ class WujiHandAdapter:
             if target is not None:
                 self._latest_target = target
 
+            # Fixed order: (1) read state, (2) judge the link watchdog and the
+            # filter seed on that state, (3) only then send. The Hand 2 filter
+            # seeds from the measured pose, so a command must never be computed
+            # from a pre-state or non-finite cache.
+            self._refresh_state()
+            self._refresh_tactile()
+            self._check_watchdog(time.monotonic())
+
             # Republish the latest target (continuous stream keeps Hand 2 MIT
-            # commands flowing and doubles as a keepalive). Skip while the
-            # state stream is silent — don't spam a dead link.
-            if self._latest_target is not None and self._connected:
+            # commands flowing and doubles as a keepalive). Skipped while the
+            # watchdog says the sensor is dead, and for Hand 2 HELD until a
+            # finite seed exists for every joint that has ever reported.
+            if (self._latest_target is not None and self._connected
+                    and (not self._is_hand2 or self._hand2_ready_to_send())):
                 try:
                     self._send(self._latest_target)
                 except Exception as e:
                     logger.warning("Wuji hand worker command error: {}", e)
 
-            self._refresh_state()
-            self._refresh_tactile()
-
-            # Watchdog on the joint_states stream (anchored at construction, so
-            # it also fires when the hand never produces a single frame).
-            stale = (time.monotonic() - self._last_state_time) > 1.0
-            if stale and self._connected:
-                self._connected = False
-                logger.warning(
-                    "Wuji hand ({}): joint_states silent >1s — link lost? "
-                    "Pausing command stream until frames resume.",
-                    self._handedness,
-                )
-            elif not stale and not self._connected:
-                self._connected = True
-                logger.info("Wuji hand ({}): joint_states resumed.", self._handedness)
-
             dt = time.monotonic() - t0
             if dt < period:
                 time.sleep(period - dt)
 
+    # Seconds without a finite measurement after which the sensor stream is
+    # treated as dead (same value the silence watchdog has always used).
+    _STALE_S = 1.0
+
+    def _check_watchdog(self, now: float) -> None:
+        """Per-joint validity watchdog on the joint_states stream.
+
+        A joint is stale when it has reported before but delivered no FINITE
+        position for _STALE_S. The hand is dead when ANY such joint is stale —
+        one healthy joint never masks another's persistent NaN. Before any
+        joint has ever reported, the construction-time anchor applies (a hand
+        that never produces a frame pauses the same way). Joints that never
+        reported at all (offline motors) are not judged: nothing drives them.
+        """
+        with self._state_lock:
+            mask = self._state_seen_mask.copy()
+            last_valid = self._last_valid_time.copy()
+        if mask.any():
+            ages = now - last_valid[mask]
+            stale_joints = [int(j) for j in np.flatnonzero(mask)[ages > self._STALE_S]]
+            stale = bool(stale_joints)
+        else:
+            stale_joints = []
+            stale = (now - self._last_state_time) > self._STALE_S
+        if stale and self._connected:
+            self._connected = False
+            logger.warning(
+                "Wuji hand ({}): no valid joint_states for >{}s{} — link lost or "
+                "sensor fault? Pausing command stream until valid frames resume.",
+                self._handedness, self._STALE_S,
+                f" on joints {stale_joints}" if stale_joints else "",
+            )
+        elif not stale and not self._connected:
+            self._connected = True
+            # Re-seed the Hand 2 filter from the measured pose: the hand may
+            # have moved (or been power-cycled) while we were silent.
+            self._cmd_pos = None
+            self._last_send_time = None
+            logger.info("Wuji hand ({}): valid joint_states resumed.", self._handedness)
+
+    def _hand2_ready_to_send(self) -> bool:
+        """Hand 2 only: may a command go out this tick?
+
+        Once the filter is seeded, yes. Before that, only if every joint that
+        has ever reported currently holds a FINITE measurement (the seed
+        source) — a NaN there means the hand's true pose is unknown, and a
+        command computed from it could yank the hand. Holding is logged once
+        per reason.
+        """
+        if self._cmd_pos is not None:
+            return True
+        with self._state_lock:
+            mask = self._state_seen_mask.copy()
+            measured = self._cached_pos.copy()
+        if not mask.any():
+            reason = "first joint_states frame"
+        elif not np.isfinite(measured[mask]).all():
+            bad = [int(j) for j in np.flatnonzero(mask & ~np.isfinite(measured))]
+            reason = f"finite measurements on joints {bad}"
+        else:
+            self._hold_reason = None
+            return True
+        if self._hold_reason != reason:
+            self._hold_reason = reason
+            logger.info("Wuji Hand 2 ({}): holding commands until {} arrive(s).",
+                        self._handedness, reason)
+        return False
+
+    def _shape_hand2(self, target: np.ndarray, now: float) -> np.ndarray:
+        """Low-pass the caller's target toward the wire; return the position command.
+
+        First-order filter with cutoff `lowpass_cutoff_hz`, stepped with the
+        measured worker period so the trajectory is the same continuous
+        exponential regardless of command_hz. Seeded from the MEASURED joint
+        positions (never from zero) so the first command after connect or a
+        link loss cannot yank the hand. The worker does not call this before
+        the first joint_states frame has been decoded.
+        """
+        if self._last_send_time is None:
+            dt = 1.0 / self._command_hz
+        else:
+            dt = min(max(now - self._last_send_time, 1e-3), 0.1)
+        target = np.asarray(target, dtype=np.float64)
+        if not np.all(np.isfinite(target)):
+            # set_joint_pos already refuses these; a second line of defence so
+            # the filter state can never be poisoned (the worker logs and
+            # skips this frame; the previous command stays on the wire).
+            raise ValueError("non-finite target reached the Hand 2 filter")
+        if self._cmd_pos is None:
+            # Measured position for every joint that has reported one; joints
+            # that never reported (offline motors) take the target — nothing
+            # drives them, so there is no jump to make.
+            with self._state_lock:
+                measured = self._cached_pos.copy()
+                mask = self._state_seen_mask.copy()
+            # Only FINITE measurements may seed the filter (a NaN that was
+            # passed through to the observation must not enter the command).
+            usable = mask & np.isfinite(measured)
+            self._cmd_pos = np.where(usable, measured, target)
+        alpha = 1.0 - np.exp(-2.0 * np.pi * self._lowpass_cutoff_hz * dt)
+        prev = self._cmd_pos
+        cmd = prev + alpha * (target - prev)
+        self._cmd_pos = cmd
+        self._last_send_time = now
+        return cmd
+
     def _send(self, target: np.ndarray) -> None:
         if self._is_hand2:
-            self._publisher.send([JointCommand(float(p), 0.0, 0.0) for p in target])
+            # Position only — velocity/effort feedforward 0, as in the vendor
+            # teleop example (and first gen, whose PDO carries positions only).
+            pos = self._shape_hand2(target, time.monotonic())
+            self._publisher.send([JointCommand(float(p), 0.0, 0.0) for p in pos])
         else:
             self._rt.set_target_position(target.tolist())
 
     def _refresh_state(self) -> None:
         """Drain joint_states, keep the newest frame in the cache."""
         try:
+            now = time.monotonic()
             latest = None
             while True:
                 frame = self._state_sub.recv()
@@ -773,18 +977,63 @@ class WujiHandAdapter:
                         "Wuji Hand 2 ({}): joint nid scheme = {}.",
                         self._handedness, self._nid_scheme,
                     )
+                # Measured values are passed through AS RECEIVED — including
+                # NaN/Inf. A non-finite measurement must stay visible: it
+                # reaches the observation, and the recorder's hand-schema
+                # check then rejects the episode (fail loud). Silently holding
+                # the last good value would record a stale pose as fresh. The
+                # only consumers shielded from it are the filter seed (finite
+                # mask below) and the link watchdog (valid frames only).
                 scheme = self._nid_scheme or "stride5"
+                any_valid = False
                 with self._state_lock:
                     for entry in latest.joints:
                         idx = _nid_to_joint(entry.nid, scheme)
-                        if idx >= 0:
-                            self._cached_pos[idx] = entry.position
+                        if idx < 0:
+                            continue
+                        val = float(entry.position)
+                        self._cached_pos[idx] = val
+                        if not self._state_seen_mask[idx]:
+                            # First report: the joint is now judged; its
+                            # validity grace starts here even if this very
+                            # value is NaN.
+                            self._state_seen_mask[idx] = True
+                            self._last_valid_time[idx] = now
+                        if np.isfinite(val):
+                            self._last_valid_time[idx] = now
+                            any_valid = True
+                        elif idx not in self._nonfinite_warned:
+                            self._nonfinite_warned.add(idx)
+                            logger.warning(
+                                "Wuji Hand 2 ({}): non-finite measured position "
+                                "{} for joint {} — passed through to the "
+                                "observation (recorder will reject the episode).",
+                                self._handedness, val, idx,
+                            )
             else:
                 pos = np.asarray(latest.position, dtype=np.float64)
+                any_valid = False
                 if pos.size == _N_JOINTS:
                     with self._state_lock:
                         self._cached_pos = pos
-            self._last_state_time = time.monotonic()
+                    finite = np.isfinite(pos)
+                    newly = ~self._state_seen_mask
+                    self._state_seen_mask[:] = True
+                    self._last_valid_time[newly] = now      # grace anchor
+                    self._last_valid_time[finite] = now
+                    any_valid = bool(finite.any())
+                    if not finite.all() and -1 not in self._nonfinite_warned:
+                        self._nonfinite_warned.add(-1)
+                        logger.warning(
+                            "Wuji hand ({}): non-finite joint_states frame passed "
+                            "through to the observation: {}",
+                            self._handedness, pos.tolist(),
+                        )
+            # The link watchdog counts only frames carrying at least one VALID
+            # measurement: a stream of NaN-only/empty frames is a dead sensor,
+            # not a live link, and must pause the command stream like silence.
+            if any_valid:
+                self._last_state_time = now
         except Exception as e:
             logger.warning("Wuji hand worker state refresh error: {}", e)
 
@@ -885,6 +1134,17 @@ class WujiHandAdapter:
         if target.size != _N_JOINTS:
             raise ValueError(
                 f"Wuji hand expects {_N_JOINTS} joint targets, got {target.size}"
+            )
+        if not np.all(np.isfinite(target)):
+            # Never let NaN/Inf reach the queue: np.clip passes NaN through,
+            # and the Hand 2 low-pass would keep it in its state forever. A
+            # non-finite target is a caller bug — refuse it so the failure
+            # surfaces (robot server: prev_gripper_command_successful=False,
+            # raise on blocking calls) instead of being recorded as motion.
+            bad = [int(i) for i in np.flatnonzero(~np.isfinite(target))]
+            raise ValueError(
+                f"Wuji hand target contains non-finite values at joints {bad}: "
+                f"{target[bad].tolist()}"
             )
         target = np.clip(target, self._limits[:, 0], self._limits[:, 1])
         try:

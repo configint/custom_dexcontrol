@@ -35,6 +35,13 @@
     # Abort the deploy when the map is still incomplete. Set false for a
     # single-hand bring-up, where auto-selection is unambiguous.
     wuji_require_hand_map: true
+    # Hand 2 is an Ethernet/UDP device with no exclusive open: if only ONE hand
+    # is reachable, both arm servers can end up driving that same hand (two
+    # conflicting 100 Hz target streams -> violent oscillation). Refuse to start
+    # the servers unless exactly one left (SN 4th char J) and one right (K) Hand 2
+    # are visible on the network. Set false only for a deliberate single-hand
+    # bring-up.
+    wuji_require_both_hands: true
 
   tasks:
     # ── Resolve gripper_type from the unit config ───────────────────────────
@@ -309,6 +316,47 @@
         - gripper_type in ["wuji_hand_v1", "wuji_hand_v2"]
         - wuji_require_hand_map | bool
         - wuji_map_recheck.stdout is defined and wuji_map_recheck.stdout != "OK"
+
+    # ── Wuji Hand 2: both hands must be reachable BEFORE the servers start ──
+    # Same scan the driver runs (wuji_sdk UDP discovery on every interface).
+    # Sides come from the firmware SN convention (4th char J=left / K=right).
+    - name: Scan for Wuji Hand 2 devices on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} \
+          'source ~/miniconda3/etc/profile.d/conda.sh && conda activate robot && python - <<PY
+        from wuji_sdk import DeviceType, SdkManager
+        side = {"J": "left", "K": "right"}
+        devs = [d for d in SdkManager.instance().scan()
+                if d.device_type in (DeviceType.WujiHand, DeviceType.WujiHand2)]
+        seen = ["%s(%s)@%s" % (d.sn, side.get(d.sn[3:4].upper(), "no-side"),
+                                getattr(d, "address", "?")) for d in devs]
+        sides = sorted(side.get(d.sn[3:4].upper(), "?") for d in devs)
+        print(("OK " if sides == ["left", "right"] else "BAD ") + ",".join(seen or ["none"]))
+        PY'
+      args:
+        executable: /bin/bash
+      register: wuji_v2_scan
+      become: false
+      changed_when: false
+      when: gripper_type == "wuji_hand_v2"
+
+    - name: Fail unless exactly one left and one right Wuji Hand 2 are visible
+      fail:
+        msg: >-
+          Wuji Hand 2 scan on dexmate: {{ wuji_v2_scan.stdout }}.
+          Both hands must be reachable before the arm servers start — with only one
+          visible, both servers would bind the SAME hand and it oscillates violently
+          on the first clutch engage. Check on dexmate:
+          `wuji upgrade --check` (must list 2 devices),
+          `ping -c2 192.168.1.110` (left) / `ping -c2 192.168.1.111` (right),
+          `nmcli -f NAME,DEVICE,STATE con show | grep wuji` (wuji-left must be activated;
+          fix: `sudo nmcli con up wuji-left`), hand power (XT30) and RJ45 link LEDs.
+          To proceed anyway on a deliberate single-hand bring-up, pass
+          -e wuji_require_both_hands=false
+      when:
+        - gripper_type == "wuji_hand_v2"
+        - wuji_require_both_hands | bool
+        - wuji_v2_scan.stdout is defined and not (wuji_v2_scan.stdout is match("OK "))
 
     - name: Display gripper port assignments
       debug:
