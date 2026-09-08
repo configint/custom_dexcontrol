@@ -80,6 +80,28 @@ except ImportError as e:
     raise ImportError(
         "wuji-sdk is not installed. Run: pip install wuji-sdk"
     ) from e
+try:  # newer wuji-sdk: per-connect options + typed exception
+    from wuji_sdk import ConnectOptions as _ConnectOptions
+except ImportError:  # pragma: no cover - older SDK
+    _ConnectOptions = None
+try:
+    from wuji_sdk import WujiException as _WujiException
+except ImportError:  # pragma: no cover - older SDK
+    _WujiException = Exception
+
+# Runtime reconnect policy (worker thread). After the link watchdog declares
+# the hand dead, wait _RECONNECT_AFTER_S for a plain stream hiccup to clear,
+# then rebuild the SDK session every _RECONNECT_INTERVAL_S until frames flow
+# again. The server process never dies for a hand dropout: the episode in
+# flight is lost (get_joint_pos reports NaN while dead -> the recorder's
+# hand-schema check discards it), the next one starts clean.
+_RECONNECT_AFTER_S = 3.0
+_RECONNECT_INTERVAL_S = 5.0
+_RECONNECT_SCAN_S = 5.0
+# Startup: transient SDK query failures (a stale DeviceBridge from a killed
+# process answers nothing for 10 s) get this many fresh sessions before the
+# server gives up.
+_STARTUP_ATTEMPTS = 3
 
 _N_FINGERS = 5
 _JOINTS_PER_FINGER = 4
@@ -282,7 +304,7 @@ class WujiHandAdapter:
         mit_kp: float = 3.0,
         mit_kd: float = 0.05,
         command_hz: float | None = None,
-        init_timeout: float = 15.0,
+        init_timeout: float = 30.0,
         joint_limits: np.ndarray | None = None,
     ) -> None:
         """Connect to a Wuji hand and prepare it for streaming commands.
@@ -338,7 +360,14 @@ class WujiHandAdapter:
         self._hold_reason: str | None = None
         self._nonfinite_warned: set[int] = set()
         self._manager = SdkManager.instance()
+        self._device_name = f"wuji_hand_{handedness}"
+        self._ctrl_params = dict(effort_limit=effort_limit, mit_kp=mit_kp, mit_kd=mit_kd,
+                                 lowpass_cutoff_hz=lowpass_cutoff_hz, init_timeout=init_timeout)
+        self._stop_event = threading.Event()
         self._hand = self._connect(sn, init_timeout)
+        # Reconnects (startup retries and runtime) always target THIS serial —
+        # never the map / auto-selection again.
+        self._bound_sn = self.serial_number
         self._is_hand2 = isinstance(self._hand, WujiHand2)
         self._command_hz = self._resolve_command_hz(self._command_hz_arg, self._is_hand2)
         # Tactile: per-model default from TACTILE_BY_MODEL (resolved here,
@@ -387,17 +416,18 @@ class WujiHandAdapter:
             self._nid_scheme: str | None = None
 
             # Command channel (model-specific) + state/tactile subscriptions.
-            self._configure_control(effort_limit, mit_kp, mit_kd,
-                                    lowpass_cutoff_hz, init_timeout)
-            self._state_sub = self._hand.joint_states().subscribe()
-            if self._tactile_enabled:
-                self._setup_tactile()
+            # A stale DeviceBridge left by a killed process makes every SDK
+            # query time out (10 s each): rebuild the session and retry a few
+            # times before failing the server start.
+            self._open_channels_with_retry(_STARTUP_ATTEMPTS, init_timeout)
 
             # Worker thread (same drain-queue pattern as RobotiqGripper).
             self._command_queue: Queue[np.ndarray] = Queue(maxsize=1)
             self._latest_target: np.ndarray | None = None
-            self._stop_event = threading.Event()
             self._connected = True
+            self._disconnected_since: float | None = None
+            self._next_reconnect_at = 0.0
+            self._reconnects = 0
             self._worker = threading.Thread(
                 target=self._worker_loop,
                 name=f"wuji-hand-{handedness}",
@@ -508,7 +538,8 @@ class WujiHandAdapter:
                 match = [d for d in devices if d.sn == sn]
                 if match:
                     return self._manager.connect(
-                        sn=sn, device_name=f"wuji_hand_{self._handedness}"
+                        sn=sn, device_name=f"wuji_hand_{self._handedness}",
+                        **self._connect_kwargs(),
                     )
                 if (sn_from_map and devices
                         and time.monotonic() >= map_grace_deadline):
@@ -549,7 +580,8 @@ class WujiHandAdapter:
                 for dev in candidates:
                     try:
                         hand = self._manager.connect(
-                            sn=dev.sn, device_name=f"wuji_hand_{self._handedness}"
+                            sn=dev.sn, device_name=f"wuji_hand_{self._handedness}",
+                            **self._connect_kwargs(),
                         )
                     except Exception as e:
                         # Auto-selection has to open a hand to ask which side it
@@ -615,6 +647,9 @@ class WujiHandAdapter:
                         dev.sn, reported, self._handedness,
                     )
                     self._manager.disconnect_all()
+            _stop = getattr(self, "_stop_event", None)
+            if _stop is not None and _stop.is_set():
+                raise ConnectionError("Wuji hand connect aborted: shutting down")
             if time.monotonic() >= deadline:
                 seen = [f"{d.sn}({_sn_handedness(d.sn) or 'no-side'})" for d in devices]
                 raise ConnectionError(
@@ -626,6 +661,109 @@ class WujiHandAdapter:
                     f"(`wuji upgrade --check` must list BOTH hands)."
                 )
             time.sleep(0.5)
+
+    @staticmethod
+    def _connect_kwargs() -> dict:
+        """Connect WITHOUT the SDK's multi-process DeviceBridge.
+
+        With the bridge, the first process to open a hand becomes a proxy for
+        every later one; when that process is killed (server restart, a
+        finished bench/identify script) its stale advertisement can keep
+        routing our SET/GET queries into the void — 10 s timeouts on every
+        call. Each arm server owns exactly one hand, so there is nothing to
+        share: connect directly, and let a genuinely busy device fail loudly.
+        """
+        if _ConnectOptions is None:
+            return {}
+        try:
+            return {"options": _ConnectOptions(enable_bridge=False)}
+        except TypeError:  # pragma: no cover - SDK without the flag
+            return {}
+
+    def _disconnect_device(self) -> None:
+        try:
+            self._manager.disconnect(self._device_name)
+        except Exception as e:
+            logger.debug("Wuji hand ({}): disconnect({}) -> {}", self._handedness,
+                         self._device_name, e)
+
+    def _open_channels(self) -> None:
+        """Configure control + subscribe state/tactile on the current self._hand."""
+        p = self._ctrl_params
+        self._configure_control(p["effort_limit"], p["mit_kp"], p["mit_kd"],
+                                p["lowpass_cutoff_hz"], p["init_timeout"])
+        self._state_sub = self._hand.joint_states().subscribe()
+        if self._tactile_enabled:
+            self._setup_tactile()
+
+    def _open_channels_with_retry(self, attempts: int, init_timeout: float) -> None:
+        last: Exception | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                self._open_channels()
+                if attempt > 1:
+                    logger.info("Wuji hand ({}): control channel up on attempt {}/{}.",
+                                self._handedness, attempt, attempts)
+                return
+            except _WujiException as e:
+                last = e
+                logger.warning(
+                    "Wuji hand ({}): SDK configuration failed (attempt {}/{}): {} — "
+                    "rebuilding the session (stale bridge / busy device?)",
+                    self._handedness, attempt, attempts, e,
+                )
+                self._teardown_channels()
+                self._disconnect_device()
+                if attempt == attempts:
+                    break
+                time.sleep(1.0)
+                self._hand = self._connect(self._bound_sn, init_timeout)
+        raise ConnectionError(
+            f"Wuji hand ({self._handedness}) sn={self._bound_sn}: SDK configuration "
+            f"kept failing after {attempts} attempts: {last}. Another process holding "
+            f"the hand (old server, joint_diag, identify_hands, wuji CLI)? Kill it and "
+            f"restart."
+        )
+
+    def _maybe_reconnect(self, now: float) -> None:
+        """Worker thread: while the link is dead, rebuild the SDK session
+        periodically so a hand dropout costs one episode, not the session."""
+        if self._connected:
+            return
+        if self._disconnected_since is None:
+            self._disconnected_since = now
+            self._next_reconnect_at = now + _RECONNECT_AFTER_S
+            return
+        if now < self._next_reconnect_at:
+            return
+        self._next_reconnect_at = now + _RECONNECT_INTERVAL_S
+        self._reconnects += 1
+        logger.warning("Wuji hand ({}): reconnect attempt #{} to sn={} ...",
+                       self._handedness, self._reconnects, self._bound_sn)
+        self._teardown_channels()
+        self._disconnect_device()
+        try:
+            self._hand = self._connect(self._bound_sn, _RECONNECT_SCAN_S)
+            self._open_channels()
+        except Exception as e:
+            logger.warning("Wuji hand ({}): reconnect #{} failed: {} — retrying in {:.0f}s",
+                           self._handedness, self._reconnects, e, _RECONNECT_INTERVAL_S)
+            self._teardown_channels()
+            return
+        # Fresh device session: forget everything learned about the old one.
+        # The watchdog flips _connected back on when VALID frames arrive; the
+        # Hand 2 filter then re-seeds from the measured pose and eases the hand
+        # back to _latest_target.
+        with self._state_lock:
+            self._state_seen_mask[:] = False
+            self._last_valid_time[:] = 0.0
+        self._nid_scheme = None
+        self._cmd_pos = None
+        self._last_send_time = None
+        self._hold_reason = None
+        self._last_state_time = now
+        logger.info("Wuji hand ({}): session rebuilt (sn={}); waiting for joint_states.",
+                    self._handedness, self._bound_sn)
 
     def _configure_control(self, effort_limit, mit_kp, mit_kd,
                            lowpass_cutoff_hz, init_timeout) -> None:
@@ -821,7 +959,9 @@ class WujiHandAdapter:
             # from a pre-state or non-finite cache.
             self._refresh_state()
             self._refresh_tactile()
-            self._check_watchdog(time.monotonic())
+            _now = time.monotonic()
+            self._check_watchdog(_now)
+            self._maybe_reconnect(_now)
 
             # Republish the latest target (continuous stream keeps Hand 2 MIT
             # commands flowing and doubles as a keepalive). Skipped while the
@@ -872,6 +1012,7 @@ class WujiHandAdapter:
             )
         elif not stale and not self._connected:
             self._connected = True
+            self._disconnected_since = None
             # Re-seed the Hand 2 filter from the measured pose: the hand may
             # have moved (or been power-cycled) while we were silent.
             self._cmd_pos = None
@@ -1118,7 +1259,17 @@ class WujiHandAdapter:
     # ------------------------------------------------------------------
 
     def get_joint_pos(self) -> np.ndarray:
-        """Return current measured joint positions (20-element array, radians)."""
+        """Return current measured joint positions (20-element array, radians).
+
+        While the link watchdog says the hand is dead (no valid joint_states
+        for >_STALE_S) the pose is UNKNOWN, and this returns NaNs rather than
+        the last value: a stale pose recorded as fresh would be data corruption
+        the recorder cannot detect, whereas NaN makes its hand-schema check
+        discard that episode. The control loop never reads this for commands
+        (targets come from the caller), so the hand simply holds.
+        """
+        if not self._connected:
+            return np.full(_N_JOINTS, np.nan)
         with self._state_lock:
             return self._cached_pos.copy()
 

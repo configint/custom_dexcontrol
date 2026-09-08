@@ -371,6 +371,33 @@
         executable: /bin/bash
       become: false
 
+    # Killing the tmux session does not guarantee its python children are gone,
+    # and hand tools left running (joint_diag --watch, identify_hands, bench
+    # scripts) keep an SDK session on the hand. A leftover process makes the
+    # new server's SDK queries time out (stale DeviceBridge) or the hand look
+    # busy. TERM first, wait, then KILL what remains. The [x] bracket trick
+    # keeps pgrep/pkill from matching this very command line.
+    - name: Kill leftover robot-server / wuji hand tool processes on dexmate
+      shell: |
+        sshpass -p '{{ dexmate_pass }}' ssh -o StrictHostKeyChecking=no {{ dexmate_user }}@{{ dexmate_ip }} bash << 'ENDSSH'
+        pat='[r]obotenv_vega/server\.py|examples/wuji/([i]dentify_hands|[j]oint_diag|[g]love_teleop_bench|[b]ench_test)\.py'
+        if pgrep -f "$pat" > /dev/null; then
+          echo "leftover processes:"; pgrep -af "$pat"
+          pkill -TERM -f "$pat" || true
+          for i in $(seq 1 10); do pgrep -f "$pat" > /dev/null || break; sleep 0.5; done
+          if pgrep -f "$pat" > /dev/null; then
+            echo "still alive after 5s, SIGKILL:"; pgrep -af "$pat"
+            pkill -KILL -f "$pat" || true
+            sleep 0.5
+          fi
+        fi
+        pgrep -af "$pat" && exit 1 || echo "no leftover robot/hand processes"
+        ENDSSH
+      args:
+        executable: /bin/bash
+      become: false
+      changed_when: false
+
     # ── Start robot gRPC servers ─────────────────────────────────────────────
     # The gripper-port flag differs between gripper types:
     #   robotiq      -> --robotiq-comport <ttyUSB>
