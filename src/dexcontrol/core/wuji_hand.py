@@ -114,18 +114,6 @@ _FINGERS = ["thumb", "index", "middle", "ring", "pinky"]
 # other fingers j1..j4 = mcp_flex/mcp_abd/pip/dip.
 _JOINT_NAMES = [f"{f}_j{j + 1}" for f in _FINGERS for j in range(_JOINTS_PER_FINGER)]
 
-# Fallback soft limits (radians, [lower, upper] per joint) assembled from the
-# published Hand 2 joint ranges. Bring-up placeholders: replaced by
-# firmware-reported limits when the SDK exposes an accessor (checked at
-# connect), and always overridable via the constructor.
-_FALLBACK_LIMITS = np.array(
-    # thumb: cmc_flex, cmc_abd, mcp, ip
-    [[-1.19, 1.29], [-1.48, 0.70], [-1.05, 1.57], [-1.05, 1.57]]
-    # index/middle/ring/pinky: mcp_flex, mcp_abd, pip, dip
-    + [[-1.05, 1.57], [-0.35, 0.35], [-1.05, 2.09], [-1.05, 2.09]] * 4,
-    dtype=np.float64,
-)
-
 # Predefined poses (radians, firmware order). "open" is the neutral extended
 # hand; "close" is a conservative power-grasp curl. Tuned on hardware at
 # bring-up (M1) — keep conservative until then.
@@ -324,7 +312,8 @@ class WujiHandAdapter:
                 own joint_command publish example; finer low-pass steps),
                 100 Hz for first gen (unchanged — the SDK filters at 500 Hz).
             init_timeout: Seconds to wait for scan/enable to complete.
-            joint_limits: Optional (20, 2) [lower, upper] radians override.
+            joint_limits: Optional (20, 2) [lower, upper] radians metadata override.
+                Informational only; Wuji targets are not position-clipped by the host.
         """
         if handedness not in ("left", "right"):
             raise ValueError(f"handedness must be 'left' or 'right', got {handedness!r}")
@@ -819,28 +808,32 @@ class WujiHandAdapter:
         finally:
             diag_sub.close()
 
-    def _resolve_limits(self, override: np.ndarray | None) -> np.ndarray:
-        """Joint limits: explicit override > SDK/firmware-reported > fallback table."""
+    def _resolve_limits(self, override: np.ndarray | None) -> np.ndarray | None:
+        """Read limit metadata; do not use it to clip Wuji target positions.
+
+        None means no application position clamp, not unlimited hardware
+        travel. Never substitute URDF design ranges for device soft limits.
+        """
         if override is not None:
             limits = np.asarray(override, dtype=np.float64)
-            if limits.shape != (_N_JOINTS, 2):
-                raise ValueError(f"joint_limits must be (20, 2), got {limits.shape}")
-            return limits
-        # No joint-limit accessor is documented in wuji_sdk; probe common names
-        # so firmware limits win automatically once the SDK exposes them.
-        for attr in ("joint_limits", "joint_soft_limits"):
-            getter = getattr(self._hand, attr, None)
-            if getter is None:
-                continue
-            try:
-                raw = getter() if callable(getter) else getter
-                raw = getattr(raw, "get", lambda: raw)()
-                limits = np.asarray(raw, dtype=np.float64).reshape(_N_JOINTS, 2)
-                logger.info("Wuji hand joint limits read from SDK ({}).", attr)
-                return limits
-            except Exception:
-                continue
-        return _FALLBACK_LIMITS.copy()
+        elif self._is_hand2:
+            logger.info("Wuji Hand 2: no application joint-position limits configured; "
+                        "passing finite targets without a fixed-table clamp.")
+            return None
+        else:
+            # SDK contract: two flat-20 lists, UPPER first, LOWER second.
+            # Errors propagate: startup must not silently invent replacement limits.
+            upper, lower = self._hand.get_soft_limits()
+            upper = np.asarray(upper, dtype=np.float64)
+            lower = np.asarray(lower, dtype=np.float64)
+            if upper.shape != (_N_JOINTS,) or lower.shape != (_N_JOINTS,):
+                raise ValueError("Wuji Hand firmware limits must be two length-20 arrays")
+            limits = np.column_stack((lower, upper))
+            logger.info("Wuji Hand v1 joint limits read from firmware via get_soft_limits().")
+        if (limits.shape != (_N_JOINTS, 2) or not np.isfinite(limits).all()
+                or np.any(limits[:, 0] > limits[:, 1])):
+            raise ValueError("Wuji joint limits must be a finite ordered (20, 2) array")
+        return limits.copy()
 
     def _setup_tactile(self) -> None:
         """Wire up the model's tactile stream.
@@ -1277,8 +1270,8 @@ class WujiHandAdapter:
         """Command the hand to absolute joint positions (non-blocking).
 
         Args:
-            joint_pos: Target positions, 20 elements, radians. Clamped to the
-                soft joint limits before sending.
+            joint_pos: Target positions, 20 finite elements, radians.
+                Passed through without application position clipping.
             wait_time: Seconds to sleep after enqueuing the command.
         """
         target = np.asarray(joint_pos, dtype=np.float64).reshape(-1)
@@ -1297,7 +1290,7 @@ class WujiHandAdapter:
                 f"Wuji hand target contains non-finite values at joints {bad}: "
                 f"{target[bad].tolist()}"
             )
-        target = np.clip(target, self._limits[:, 0], self._limits[:, 1])
+        target = target.copy()
         try:
             self._command_queue.put_nowait(target)
         except Full:
@@ -1344,9 +1337,9 @@ class WujiHandAdapter:
             )
 
     @property
-    def joint_limits(self) -> np.ndarray:
-        """(20, 2) [lower, upper] soft limits in radians."""
-        return self._limits.copy()
+    def joint_limits(self) -> np.ndarray | None:
+        """Informational (20, 2) limits in radians, or None; not a host clamp."""
+        return None if self._limits is None else self._limits.copy()
 
     @property
     def model(self) -> str:

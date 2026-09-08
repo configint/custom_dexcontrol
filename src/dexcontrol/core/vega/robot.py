@@ -622,9 +622,8 @@ class VegaRobot:
 
         Scalar (length 1) → existing normalized gripper pipeline.
         Multi-DoF (length>1) → direct joint-position command on the hand,
-        bypassing the [0,1] scalar collapse. Clamped to the hand's soft joint
-        limits when the driver exposes them (last line of defense — the
-        upstream controller clamps too).
+        bypassing the [0,1] scalar collapse. Wuji targets are passed through;
+        other hands use soft limits when the driver exposes them.
         """
         if hand_action.size <= 1:
             self.update_gripper(
@@ -647,8 +646,13 @@ class VegaRobot:
                         f"hand velocity command size {target.size} != state size {current.size}"
                     )
                 target = current + target * (1.0 / max(1, self.control_hz))
+            # Check before clipping: infinities must fail rather than turn
+            # into finite boundary commands that the adapter would accept.
+            if not np.isfinite(target).all():
+                raise ValueError("Hand target contains non-finite values")
             limits = getattr(self.hand, "joint_limits", None)
-            if limits is not None and np.asarray(limits).shape == (target.size, 2):
+            is_wuji = getattr(self.hand, "model", None) in ("wuji_hand_v1", "wuji_hand_v2")
+            if not is_wuji and limits is not None and np.asarray(limits).shape == (target.size, 2):
                 limits = np.asarray(limits, dtype=np.float64)
                 target = np.clip(target, limits[:, 0], limits[:, 1])
             wait_time = (1.0 / max(1, self.control_hz)) if blocking else 0.0
